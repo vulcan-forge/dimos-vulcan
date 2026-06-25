@@ -355,7 +355,7 @@ class WebsocketVisModule(Module):
     def _run_uvicorn_server(self) -> None:
         config = uvicorn.Config(
             self.app,  # type: ignore[arg-type]
-            host=global_config.listen_host,
+            host=self.config.g.listen_host,
             port=self.config.port,
             log_level="error",  # Reduce verbosity
         )
