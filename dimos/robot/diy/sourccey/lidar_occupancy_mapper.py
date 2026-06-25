@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
 import math
+from pathlib import Path
+import time
 from typing import Any
 
+import cv2
 import numpy as np
 from reactivex.disposable import Disposable
 
+from dimos.constants import DIMOS_PROJECT_ROOT
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In, Out
@@ -17,6 +22,8 @@ from dimos.msgs.nav_msgs.OccupancyGrid import CostValues, OccupancyGrid
 
 from .lidar_geometry import scan_to_local_xy
 from .lidar_types import PlanarLidarScan
+
+_DEFAULT_EXPORT_ROOT = DIMOS_PROJECT_ROOT / "assets" / "output" / "sourccey_maps"
 
 
 def _blend_angle_rad(a: float, b: float, weight: float) -> float:
@@ -44,6 +51,10 @@ class SourcceyLidarOccupancyMapperConfig(ModuleConfig):
     landmark_pose_blend: float = 0.35
     landmark_pose_max_age_s: float = 2.0
     frame_id: str = "map"
+    export_dir: str = str(_DEFAULT_EXPORT_ROOT)
+    export_png_name: str = "latest_map.png"
+    export_metadata_name: str = "latest_map.json"
+    export_interval_s: float = 1.0
 
 
 class SourcceyLidarOccupancyMapper(Module):
@@ -68,10 +79,15 @@ class SourcceyLidarOccupancyMapper(Module):
         self._grid = np.full((self._height, self._width), int(CostValues.UNKNOWN), dtype=np.int8)
         self._latest_odom: PoseStamped | None = None
         self._latest_landmark_pose: PoseStamped | None = None
+        self._last_export_ts = 0.0
+        self._export_dir = Path(self.config.export_dir)
+        self._export_png_path = self._export_dir / self.config.export_png_name
+        self._export_metadata_path = self._export_dir / self.config.export_metadata_name
 
     @rpc
     def start(self) -> None:
         super().start()
+        self._export_dir.mkdir(parents=True, exist_ok=True)
         self.register_disposable(Disposable(self.odom.subscribe(self._on_odom)))
         self.register_disposable(Disposable(self.landmark_pose.subscribe(self._on_landmark_pose)))
         self.register_disposable(Disposable(self.scan.subscribe(self._on_scan)))
@@ -79,6 +95,7 @@ class SourcceyLidarOccupancyMapper(Module):
     @rpc
     def reset_map(self) -> None:
         self._grid.fill(int(CostValues.UNKNOWN))
+        self._write_map_export(ts=time.time(), pose=self._current_pose())
 
     def _on_odom(self, msg: PoseStamped) -> None:
         self._latest_odom = msg
@@ -149,6 +166,7 @@ class SourcceyLidarOccupancyMapper(Module):
                 self._grid[hit_cell[1], hit_cell[0]] = int(CostValues.OCCUPIED)
 
         self.global_costmap.publish(self._make_grid_msg(scan.ts))
+        self._maybe_export_map(ts=float(scan.ts), pose=pose)
 
     def _inside_grid(self, x: int, y: int) -> bool:
         return 0 <= x < self._width and 0 <= y < self._height
@@ -171,3 +189,48 @@ class SourcceyLidarOccupancyMapper(Module):
             frame_id=self.config.frame_id,
             ts=float(ts),
         )
+
+    def _maybe_export_map(self, ts: float, pose: PoseStamped | None) -> None:
+        interval_s = max(0.1, float(self.config.export_interval_s))
+        if ts - self._last_export_ts < interval_s:
+            return
+        self._write_map_export(ts=ts, pose=pose)
+        self._last_export_ts = ts
+
+    def _write_map_export(self, ts: float, pose: PoseStamped | None) -> None:
+        image = np.full((self._height, self._width), 127, dtype=np.uint8)
+        image[self._grid == int(CostValues.FREE)] = 255
+        image[self._grid >= int(CostValues.OCCUPIED)] = 0
+        image = np.flipud(image)
+        cv2.imwrite(str(self._export_png_path), image)
+
+        occupied_cells = int(np.sum(self._grid >= int(CostValues.OCCUPIED)))
+        free_cells = int(np.sum(self._grid == int(CostValues.FREE)))
+        unknown_cells = int(np.sum(self._grid == int(CostValues.UNKNOWN)))
+        metadata = {
+            "schema": "sourccey.occupancy_map.v1",
+            "ts": float(ts),
+            "frame_id": self.config.frame_id,
+            "resolution_m": self._resolution_m,
+            "width": self._width,
+            "height": self._height,
+            "origin": {
+                "x": self._origin_x,
+                "y": self._origin_y,
+            },
+            "counts": {
+                "occupied": occupied_cells,
+                "free": free_cells,
+                "unknown": unknown_cells,
+            },
+            "pose": None
+            if pose is None
+            else {
+                "x": float(pose.x),
+                "y": float(pose.y),
+                "z": float(pose.z),
+                "yaw": float(pose.yaw),
+            },
+            "png_path": str(self._export_png_path),
+        }
+        self._export_metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
