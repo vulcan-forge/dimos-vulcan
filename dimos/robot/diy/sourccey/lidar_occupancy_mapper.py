@@ -13,6 +13,7 @@ from reactivex.disposable import Disposable
 from dimos.constants import DIMOS_PROJECT_ROOT
 from dimos.core.core import rpc
 from dimos.core.module import Module, ModuleConfig
+from dimos.core.module import logger
 from dimos.core.stream import In, Out
 from dimos.msgs.geometry_msgs.Pose import Pose
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
@@ -88,9 +89,15 @@ class SourcceyLidarOccupancyMapper(Module):
     def start(self) -> None:
         super().start()
         self._export_dir.mkdir(parents=True, exist_ok=True)
+        self._write_map_export(ts=time.time(), pose=self._current_pose())
         self.register_disposable(Disposable(self.odom.subscribe(self._on_odom)))
         self.register_disposable(Disposable(self.landmark_pose.subscribe(self._on_landmark_pose)))
         self.register_disposable(Disposable(self.scan.subscribe(self._on_scan)))
+
+    @rpc
+    def stop(self) -> None:
+        self._write_map_export(ts=time.time(), pose=self._current_pose())
+        super().stop()
 
     @rpc
     def reset_map(self) -> None:
@@ -234,3 +241,11 @@ class SourcceyLidarOccupancyMapper(Module):
             "png_path": str(self._export_png_path),
         }
         self._export_metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        logger.info(
+            "Sourccey occupancy map exported png=%s metadata=%s occupied=%s free=%s unknown=%s",
+            self._export_png_path,
+            self._export_metadata_path,
+            occupied_cells,
+            free_cells,
+            unknown_cells,
+        )
