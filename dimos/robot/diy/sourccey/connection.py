@@ -472,6 +472,12 @@ class SourcceyConnection(Module, Camera, IMU):
         super().stop()
 
     def _on_cmd_vel(self, msg: Twist) -> None:
+        logger.info(
+            "SourcceyConnection received cmd_vel",
+            linear_x=round(float(msg.linear.x), 4),
+            linear_y=round(float(msg.linear.y), 4),
+            angular_z=round(float(msg.angular.z), 4),
+        )
         self.move(msg)
 
 
@@ -513,6 +519,12 @@ class SourcceyConnection(Module, Camera, IMU):
             state=state,
             untorque_left=bool(self.config.untorque_arms_during_base_control),
             untorque_right=bool(self.config.untorque_arms_during_base_control),
+        )
+        logger.info(
+            "Sending Sourccey base command",
+            x_vel=round(vx, 4),
+            y_vel=round(vy, 4),
+            theta_vel=round(wz, 4),
         )
         if not self._send_command_payload(payload):
             return False

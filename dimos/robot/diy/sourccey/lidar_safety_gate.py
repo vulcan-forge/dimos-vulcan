@@ -9,9 +9,12 @@ from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In, Out
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
+from dimos.utils.logging_config import setup_logger
 
 from .lidar_geometry import detect_stop_zone
 from .lidar_types import PlanarLidarScan, StopZoneConfig, StopZoneState
+
+logger = setup_logger()
 
 
 class SourcceyLidarSafetyGateConfig(ModuleConfig):
@@ -66,13 +69,27 @@ class SourcceyLidarSafetyGate(Module):
 
     def _on_cmd_vel(self, cmd_vel: Twist) -> None:
         if not self._latest_state.blocked or cmd_vel.linear.x <= 0.0:
+            logger.info(
+                "LidarSafetyGate pass-through",
+                blocked=self._latest_state.blocked,
+                linear_x=round(float(cmd_vel.linear.x), 4),
+                linear_y=round(float(cmd_vel.linear.y), 4),
+                angular_z=round(float(cmd_vel.angular.z), 4),
+            )
             self.cmd_vel.publish(cmd_vel)
             return
 
+        logger.warning(
+            "LidarSafetyGate blocked forward motion",
+            blocking_points=int(self._latest_state.blocking_points),
+            nearest_blocking_distance_m=self._latest_state.nearest_blocking_distance_m,
+            linear_x=round(float(cmd_vel.linear.x), 4),
+            linear_y=round(float(cmd_vel.linear.y), 4),
+            angular_z=round(float(cmd_vel.angular.z), 4),
+        )
         self.cmd_vel.publish(
             Twist(
                 linear=Vector3(0.0, cmd_vel.linear.y, cmd_vel.linear.z),
                 angular=Vector3(cmd_vel.angular.x, cmd_vel.angular.y, cmd_vel.angular.z),
             )
         )
-

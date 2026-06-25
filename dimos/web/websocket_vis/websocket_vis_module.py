@@ -32,7 +32,7 @@ from dimos_lcm.std_msgs import Bool
 from reactivex.disposable import Disposable
 import socketio  # type: ignore[import-untyped]
 from starlette.applications import Starlette
-from starlette.responses import FileResponse, RedirectResponse, Response
+from starlette.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
 import uvicorn
 
@@ -41,6 +41,7 @@ from dimos.utils.data import get_data
 # Path to the frontend HTML templates and command-center build
 _TEMPLATES_DIR = FilePath(__file__).parent.parent / "templates"
 _DASHBOARD_HTML = _TEMPLATES_DIR / "rerun_dashboard.html"
+_COMMAND_CENTER_HTML = _TEMPLATES_DIR / "sourccey_command_center.html"
 _COMMAND_CENTER_DIR = (
     FilePath(__file__).parent.parent / "command-center-extension" / "dist-standalone"
 )
@@ -242,20 +243,41 @@ class WebsocketVisModule(Module):
             return FileResponse(_DASHBOARD_HTML, media_type="text/html")
 
         async def serve_command_center(request):  # type: ignore[no-untyped-def]
-            """Serve the command center 2D visualization (built React app)."""
+            """Serve the lightweight Sourccey command center."""
+            if _COMMAND_CENTER_HTML.exists():
+                return FileResponse(_COMMAND_CENTER_HTML, media_type="text/html")
             index_file = get_data("command_center.html")
             if index_file.exists():
                 return FileResponse(index_file, media_type="text/html")
-            else:
-                return Response(
-                    content="Command center not built. Run: cd dimos/web/command-center-extension && npm install && npm run build:standalone",
-                    status_code=503,
-                    media_type="text/plain",
-                )
+            return Response(
+                content="Command center not built. Run: cd dimos/web/command-center-extension && npm install && npm run build:standalone",
+                status_code=503,
+                media_type="text/plain",
+            )
+
+        async def api_move(request):  # type: ignore[no-untyped-def]
+            data = await request.json()
+            if not isinstance(data, dict):
+                return JSONResponse({"ok": False, "error": "Expected JSON object"}, status_code=400)
+            self._publish_move_command("http", data)
+            return JSONResponse({"ok": True})
+
+        async def api_start_explore(request):  # type: ignore[no-untyped-def]
+            logger.info("Starting exploration via HTTP command-center")
+            self.explore_cmd.publish(Bool(data=True))
+            return JSONResponse({"ok": True})
+
+        async def api_stop_explore(request):  # type: ignore[no-untyped-def]
+            logger.info("Stopping exploration via HTTP command-center")
+            self.stop_explore_cmd.publish(Bool(data=True))
+            return JSONResponse({"ok": True})
 
         routes = [
             Route("/", serve_index),
             Route("/command-center", serve_command_center),
+            Route("/api/move", api_move, methods=["POST"]),
+            Route("/api/start-explore", api_start_explore, methods=["POST"]),
+            Route("/api/stop-explore", api_stop_explore, methods=["POST"]),
         ]
 
         starlette_app = Starlette(routes=routes)
@@ -330,27 +352,7 @@ class WebsocketVisModule(Module):
 
         @self.sio.event  # type: ignore[untyped-decorator]
         async def move_command(sid: str, data: dict[str, Any]) -> None:
-            # Publish Twist if transport is configured
-            if self.tele_cmd_vel and self.tele_cmd_vel.transport:
-                twist = Twist(
-                    linear=Vector3(data["linear"]["x"], data["linear"]["y"], data["linear"]["z"]),
-                    angular=Vector3(
-                        data["angular"]["x"], data["angular"]["y"], data["angular"]["z"]
-                    ),
-                )
-                self.tele_cmd_vel.publish(twist)
-
-            # Publish TwistStamped if transport is configured
-            if self.movecmd_stamped and self.movecmd_stamped.transport:
-                twist_stamped = TwistStamped(
-                    ts=time.time(),
-                    frame_id="base_link",
-                    linear=Vector3(data["linear"]["x"], data["linear"]["y"], data["linear"]["z"]),
-                    angular=Vector3(
-                        data["angular"]["x"], data["angular"]["y"], data["angular"]["z"]
-                    ),
-                )
-                self.movecmd_stamped.publish(twist_stamped)
+            self._publish_move_command(sid, data)
 
     def _run_uvicorn_server(self) -> None:
         config = uvicorn.Config(
@@ -402,3 +404,44 @@ class WebsocketVisModule(Module):
     def _emit(self, event: str, data: Any) -> None:
         if self._broadcast_loop and not self._broadcast_loop.is_closed():
             asyncio.run_coroutine_threadsafe(self.sio.emit(event, data), self._broadcast_loop)
+
+    def _publish_move_command(self, sid: str, data: dict[str, Any]) -> None:
+        logger.info("Received web move_command", sid=sid, data=data)
+
+        linear = data.get("linear", {})
+        angular = data.get("angular", {})
+        twist = Twist(
+            linear=Vector3(
+                float(linear.get("x", 0.0)),
+                float(linear.get("y", 0.0)),
+                float(linear.get("z", 0.0)),
+            ),
+            angular=Vector3(
+                float(angular.get("x", 0.0)),
+                float(angular.get("y", 0.0)),
+                float(angular.get("z", 0.0)),
+            ),
+        )
+
+        if self.tele_cmd_vel and self.tele_cmd_vel.transport:
+            logger.info(
+                "Publishing tele_cmd_vel",
+                linear_x=round(float(twist.linear.x), 4),
+                linear_y=round(float(twist.linear.y), 4),
+                angular_z=round(float(twist.angular.z), 4),
+            )
+            self.tele_cmd_vel.publish(twist)
+        else:
+            logger.warning("tele_cmd_vel transport is unavailable for web move_command")
+
+        if self.movecmd_stamped and self.movecmd_stamped.transport:
+            self.movecmd_stamped.publish(
+                TwistStamped(
+                    ts=time.time(),
+                    frame_id="base_link",
+                    linear=twist.linear,
+                    angular=twist.angular,
+                )
+            )
+        else:
+            logger.debug("movecmd_stamped transport is unavailable for web move_command")

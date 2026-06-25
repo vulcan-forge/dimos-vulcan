@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Sourccey Command Center</title>
+    <style>
+        :root {
+            color-scheme: dark;
+            --bg: #06090f;
+            --panel: #111722;
+            --panel-2: #0c121b;
+            --border: #253043;
+            --text: #eef4ff;
+            --muted: #9fb0c8;
+            --good: #2bb673;
+            --warn: #ffb020;
+            --danger: #ff5d5d;
+            --accent: #4da3ff;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            background:
+                radial-gradient(circle at top, rgba(77, 163, 255, 0.14), transparent 35%),
+                linear-gradient(180deg, #0b111a 0%, var(--bg) 100%);
+            color: var(--text);
+            font-family: "Segoe UI", "Aptos", system-ui, sans-serif;
+        }
+        .wrap {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            padding: 14px;
+            height: 100vh;
+        }
+        .card {
+            background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 14px;
+            box-shadow: 0 14px 40px rgba(0, 0, 0, 0.22);
+        }
+        h1 {
+            margin: 0 0 6px;
+            font-size: 1.1rem;
+            letter-spacing: 0.02em;
+        }
+        .sub {
+            color: var(--muted);
+            font-size: 0.92rem;
+            line-height: 1.4;
+        }
+        .row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 12px;
+        }
+        button {
+            appearance: none;
+            border: 1px solid rgba(255,255,255,0.14);
+            border-radius: 10px;
+            background: #16324e;
+            color: white;
+            padding: 10px 14px;
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        button:hover { filter: brightness(1.08); }
+        button.secondary { background: #1a2230; }
+        button.good { background: #155e42; }
+        button.warn { background: #6c4a06; }
+        button.danger { background: #6f1f1f; }
+        button.active {
+            outline: 2px solid var(--accent);
+            box-shadow: 0 0 0 4px rgba(77, 163, 255, 0.2);
+        }
+        .status {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
+            margin-top: 12px;
+        }
+        .pill {
+            background: var(--panel-2);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 10px 12px;
+        }
+        .label {
+            color: var(--muted);
+            font-size: 0.8rem;
+            margin-bottom: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+        .value {
+            font-size: 0.98rem;
+            font-weight: 700;
+        }
+        .keys {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 8px;
+            max-width: 240px;
+            margin-top: 12px;
+        }
+        .key {
+            background: #0d1520;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 12px 8px;
+            text-align: center;
+            color: var(--muted);
+            font-weight: 700;
+        }
+        .key.active {
+            background: rgba(77, 163, 255, 0.2);
+            border-color: var(--accent);
+            color: var(--text);
+        }
+        .footer {
+            margin-top: auto;
+            color: var(--muted);
+            font-size: 0.84rem;
+            line-height: 1.45;
+        }
+        @media (max-width: 800px) {
+            .status { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="wrap">
+        <div class="card">
+            <h1>Sourccey Command Center</h1>
+            <div class="sub">
+                Click <strong>Start Keyboard Control</strong>, then use <strong>W/A/S/D</strong> or the arrow keys.
+                This page sends direct motion commands into the same Dimos teleop stream the mapper uses.
+            </div>
+            <div class="row">
+                <button id="keyboardToggle" class="good">Start Keyboard Control</button>
+                <button id="stopMotion" class="danger">Stop Motion</button>
+                <button id="startExplore" class="secondary">Start Exploration</button>
+                <button id="stopExplore" class="warn">Stop Exploration</button>
+            </div>
+            <div class="status">
+                <div class="pill">
+                    <div class="label">Keyboard</div>
+                    <div id="keyboardStatus" class="value">DISABLED</div>
+                </div>
+                <div class="pill">
+                    <div class="label">Last Command</div>
+                    <div id="commandStatus" class="value">x=0.00 y=0.00 yaw=0.00</div>
+                </div>
+            </div>
+            <div class="keys">
+                <div class="key" data-key="arrowleft">A / Left</div>
+                <div class="key" data-key="arrowup">W / Up</div>
+                <div class="key" data-key="arrowright">D / Right</div>
+                <div class="key"></div>
+                <div class="key" data-key="arrowdown">S / Down</div>
+                <div class="key"></div>
+            </div>
+        </div>
+        <div class="footer">
+            If the robot still does not move, watch the Pi terminal for:
+            <code>Received web move_command</code>,
+            <code>LidarSafetyGate pass-through</code>,
+            and <code>Sending Sourccey base command</code>.
+        </div>
+    </div>
+    <script>
+        (() => {
+            const moveEndpoint = "/api/move";
+            const startExploreEndpoint = "/api/start-explore";
+            const stopExploreEndpoint = "/api/stop-explore";
+            const keyboardToggle = document.getElementById("keyboardToggle");
+            const stopMotionButton = document.getElementById("stopMotion");
+            const startExploreButton = document.getElementById("startExplore");
+            const stopExploreButton = document.getElementById("stopExplore");
+            const keyboardStatus = document.getElementById("keyboardStatus");
+            const commandStatus = document.getElementById("commandStatus");
+            const keyEls = new Map(
+                Array.from(document.querySelectorAll("[data-key]")).map((el) => [el.dataset.key, el])
+            );
+
+            const SPEEDS = {
+                linear: 0.45,
+                angular: 0.85,
+                intervalMs: 90,
+            };
+
+            const pressed = new Set();
+            let enabled = false;
+            let timer = null;
+
+            function updateKeyboardUi() {
+                keyboardStatus.textContent = enabled ? "ENABLED" : "DISABLED";
+                keyboardToggle.textContent = enabled ? "Disable Keyboard Control" : "Start Keyboard Control";
+                keyboardToggle.classList.toggle("active", enabled);
+                keyEls.forEach((el, key) => {
+                    const aliases = aliasKeysForDisplay(key);
+                    const active = aliases.some((alias) => pressed.has(alias));
+                    el.classList.toggle("active", active);
+                });
+            }
+
+            function aliasKeysForDisplay(key) {
+                if (key === "arrowup") return ["arrowup", "w"];
+                if (key === "arrowdown") return ["arrowdown", "s"];
+                if (key === "arrowleft") return ["arrowleft", "a"];
+                if (key === "arrowright") return ["arrowright", "d"];
+                return [key];
+            }
+
+            async function postJson(url, body) {
+                const response = await fetch(url, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(body),
+                });
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+            }
+
+            function currentCommand() {
+                let linearX = 0.0;
+                let angularZ = 0.0;
+
+                if (pressed.has("w") || pressed.has("arrowup")) linearX += SPEEDS.linear;
+                if (pressed.has("s") || pressed.has("arrowdown")) linearX -= SPEEDS.linear;
+                if (pressed.has("a") || pressed.has("arrowleft")) angularZ += SPEEDS.angular;
+                if (pressed.has("d") || pressed.has("arrowright")) angularZ -= SPEEDS.angular;
+
+                return {
+                    linear: { x: linearX, y: 0.0, z: 0.0 },
+                    angular: { x: 0.0, y: 0.0, z: angularZ },
+                };
+            }
+
+            async function sendCurrentCommand() {
+                const command = currentCommand();
+                commandStatus.textContent =
+                    `x=${command.linear.x.toFixed(2)} y=${command.linear.y.toFixed(2)} yaw=${command.angular.z.toFixed(2)}`;
+                try {
+                    await postJson(moveEndpoint, command);
+                } catch (error) {
+                    console.error("Failed to send move command", error);
+                }
+            }
+
+            function stopLoop() {
+                if (timer !== null) {
+                    clearInterval(timer);
+                    timer = null;
+                }
+            }
+
+            function startLoop() {
+                stopLoop();
+                timer = setInterval(() => {
+                    if (!enabled) return;
+                    void sendCurrentCommand();
+                }, SPEEDS.intervalMs);
+            }
+
+            async function forceStop() {
+                pressed.clear();
+                updateKeyboardUi();
+                stopLoop();
+                commandStatus.textContent = "x=0.00 y=0.00 yaw=0.00";
+                try {
+                    await postJson(moveEndpoint, {
+                        linear: { x: 0.0, y: 0.0, z: 0.0 },
+                        angular: { x: 0.0, y: 0.0, z: 0.0 },
+                    });
+                } catch (error) {
+                    console.error("Failed to send stop command", error);
+                }
+            }
+
+            function setEnabled(next) {
+                enabled = next;
+                updateKeyboardUi();
+                if (enabled) {
+                    startLoop();
+                    void sendCurrentCommand();
+                } else {
+                    void forceStop();
+                }
+            }
+
+            keyboardToggle.addEventListener("click", () => {
+                setEnabled(!enabled);
+                if (enabled) {
+                    window.focus();
+                }
+            });
+
+            stopMotionButton.addEventListener("click", () => {
+                void forceStop();
+            });
+
+            startExploreButton.addEventListener("click", async () => {
+                try {
+                    await postJson(startExploreEndpoint, {});
+                } catch (error) {
+                    console.error("Failed to start exploration", error);
+                }
+            });
+
+            stopExploreButton.addEventListener("click", async () => {
+                try {
+                    await postJson(stopExploreEndpoint, {});
+                } catch (error) {
+                    console.error("Failed to stop exploration", error);
+                }
+            });
+
+            window.addEventListener("keydown", (event) => {
+                if (!enabled) return;
+                const key = event.key.toLowerCase();
+                if (!["w", "a", "s", "d", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(key)) {
+                    return;
+                }
+                event.preventDefault();
+                pressed.add(key);
+                updateKeyboardUi();
+                void sendCurrentCommand();
+            });
+
+            window.addEventListener("keyup", (event) => {
+                const key = event.key.toLowerCase();
+                if (!pressed.has(key)) return;
+                event.preventDefault();
+                pressed.delete(key);
+                updateKeyboardUi();
+                void sendCurrentCommand();
+            });
+
+            window.addEventListener("blur", () => {
+                if (enabled) {
+                    void forceStop();
+                }
+            });
+
+            document.addEventListener("visibilitychange", () => {
+                if (document.hidden && enabled) {
+                    void forceStop();
+                }
+            });
+
+            updateKeyboardUi();
+        })();
+    </script>
+</body>
+</html>
