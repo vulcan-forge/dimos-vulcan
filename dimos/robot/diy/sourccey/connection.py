@@ -416,6 +416,7 @@ class SourcceyConnection(Module, Camera, IMU):
         self._last_slam_wall_ts: float | None = None
         self._latest_robot_state: _RobotObservationState | None = None
         self._latest_color_image: Image | None = None
+        self._last_observation_wall_ts: float | None = None
 
     @rpc
     def start(self) -> None:
@@ -648,6 +649,7 @@ class SourcceyConnection(Module, Camera, IMU):
         state = _parse_robot_observation(latest_payload)
         self._set_robot_state(state)
         self._publish_joint_state(state)
+        self._publish_observation_pose(state)
 
     def _set_robot_state(self, state: _RobotObservationState) -> None:
         with self._state_lock:
@@ -703,6 +705,40 @@ class SourcceyConnection(Module, Camera, IMU):
             untorque_right=bool(self.config.untorque_arms_during_base_control),
         )
         self._send_command_payload(payload)
+
+    def _publish_observation_pose(self, state: _RobotObservationState) -> None:
+        wall_ts = time.time()
+        dt = 0.0
+        if self._last_observation_wall_ts is not None:
+            dt = max(0.0, min(wall_ts - self._last_observation_wall_ts, 0.25))
+        self._last_observation_wall_ts = wall_ts
+
+        theta_rate = float(state.theta_vel)
+        self._yaw_rad += theta_rate * dt
+
+        slam_is_fresh = (
+            self._last_slam_position_xy is not None
+            and self._last_slam_wall_ts is not None
+            and (wall_ts - self._last_slam_wall_ts) <= float(self.config.slam_output_stale_after_s)
+        )
+        if slam_is_fresh:
+            self._dead_reckon_xy = np.asarray(self._last_slam_position_xy, dtype=np.float64)
+        else:
+            vx = float(state.x_vel)
+            vy = float(state.y_vel)
+            cos_yaw = math.cos(self._yaw_rad)
+            sin_yaw = math.sin(self._yaw_rad)
+            dx = (vx * cos_yaw) - (vy * sin_yaw)
+            dy = (vx * sin_yaw) + (vy * cos_yaw)
+            self._dead_reckon_xy += np.asarray((dx * dt, dy * dt), dtype=np.float64)
+
+        pose = PoseStamped(
+            ts=wall_ts,
+            frame_id="world",
+            position=[float(self._dead_reckon_xy[0]), float(self._dead_reckon_xy[1]), 0.0],
+            orientation=Quaternion.from_euler(Vector3(0.0, 0.0, self._yaw_rad)),
+        )
+        self.odom.publish(pose)
 
     def _publish_packet(self, packet: _SlamInputPacket) -> None:
         primary_frame = self._get_camera(packet, self.config.primary_camera_key)
