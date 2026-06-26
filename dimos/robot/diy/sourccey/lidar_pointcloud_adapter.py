@@ -27,6 +27,8 @@ class SourcceyLidarPointCloudAdapterConfig(ModuleConfig):
     forward_angle_deg: float = 180.0
     valid_angle_half_width_deg: float = 90.0
     invert_lateral_axis: bool = False
+    lidar_mount_x_m: float = 0.0
+    lidar_mount_y_m: float = 0.0
     max_distance_m: float = 8.0
     min_confidence: int = 0
     free_ray_step_m: float = 0.05
@@ -89,6 +91,33 @@ def _transform_xy(points_local_xy: np.ndarray, pose: PoseStamped) -> np.ndarray:
     world = points_local_xy @ rotation.T
     world[:, 0] += float(pose.x)
     world[:, 1] += float(pose.y)
+    return world
+
+
+def _sensor_origin_xy(pose: PoseStamped, *, mount_x_m: float, mount_y_m: float) -> tuple[float, float]:
+    cos_yaw = math.cos(float(pose.yaw))
+    sin_yaw = math.sin(float(pose.yaw))
+    sensor_x = float(pose.x) + (float(mount_x_m) * cos_yaw) - (float(mount_y_m) * sin_yaw)
+    sensor_y = float(pose.y) + (float(mount_x_m) * sin_yaw) + (float(mount_y_m) * cos_yaw)
+    return sensor_x, sensor_y
+
+
+def _transform_xy_with_mount(
+    points_local_xy: np.ndarray,
+    pose: PoseStamped,
+    *,
+    mount_x_m: float,
+    mount_y_m: float,
+) -> np.ndarray:
+    if points_local_xy.size == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    sensor_x, sensor_y = _sensor_origin_xy(pose, mount_x_m=mount_x_m, mount_y_m=mount_y_m)
+    cos_yaw = math.cos(float(pose.yaw))
+    sin_yaw = math.sin(float(pose.yaw))
+    rotation = np.asarray(((cos_yaw, -sin_yaw), (sin_yaw, cos_yaw)), dtype=np.float32)
+    world = points_local_xy @ rotation.T
+    world[:, 0] += float(sensor_x)
+    world[:, 1] += float(sensor_y)
     return world
 
 
@@ -159,6 +188,8 @@ def build_pointcloud_from_scan(
     forward_angle_deg: float,
     valid_angle_half_width_deg: float,
     invert_lateral_axis: bool,
+    lidar_mount_x_m: float,
+    lidar_mount_y_m: float,
     max_distance_m: float,
     min_confidence: int,
     free_ray_step_m: float,
@@ -201,11 +232,21 @@ def build_pointcloud_from_scan(
             free_points_local.append(ray_points)
 
     free_world_xy = (
-        _transform_xy(np.vstack(free_points_local).astype(np.float32, copy=False), pose)
+        _transform_xy_with_mount(
+            np.vstack(free_points_local).astype(np.float32, copy=False),
+            pose,
+            mount_x_m=lidar_mount_x_m,
+            mount_y_m=lidar_mount_y_m,
+        )
         if free_points_local
         else np.zeros((0, 2), dtype=np.float32)
     )
-    obstacle_world_xy = _transform_xy(obstacle_points_local, pose)
+    obstacle_world_xy = _transform_xy_with_mount(
+        obstacle_points_local,
+        pose,
+        mount_x_m=lidar_mount_x_m,
+        mount_y_m=lidar_mount_y_m,
+    )
 
     free_world_xyz = (
         np.column_stack(
@@ -245,14 +286,21 @@ def build_registered_scan_from_local_points(
     z_height_m: float,
     frame_id: str,
     timestamp: float,
+    lidar_mount_x_m: float,
+    lidar_mount_y_m: float,
 ) -> PointCloud2:
     if local_points_xy.size == 0:
         return PointCloud2.from_numpy(np.zeros((0, 3), dtype=np.float32), frame_id=frame_id, timestamp=timestamp)
 
+    sensor_x, sensor_y = _sensor_origin_xy(
+        pose,
+        mount_x_m=lidar_mount_x_m,
+        mount_y_m=lidar_mount_y_m,
+    )
     world_xy = _transform_local_points(
         local_points_xy,
-        x=float(pose.x),
-        y=float(pose.y),
+        x=float(sensor_x),
+        y=float(sensor_y),
         yaw=float(pose.yaw),
     )
     world_xyz = np.column_stack(
@@ -300,10 +348,15 @@ class SourcceyLidarPointCloudAdapter(Module):
             return self._submap_points_world
         if self._last_local_points is None or self._last_matched_pose is None:
             return np.zeros((0, 2), dtype=np.float32)
+        sensor_x, sensor_y = _sensor_origin_xy(
+            self._last_matched_pose,
+            mount_x_m=float(self.config.lidar_mount_x_m),
+            mount_y_m=float(self.config.lidar_mount_y_m),
+        )
         return _transform_local_points(
             _downsample_points(self._last_local_points, max(int(self.config.scan_match_max_points), 24)),
-            x=float(self._last_matched_pose.x),
-            y=float(self._last_matched_pose.y),
+            x=float(sensor_x),
+            y=float(sensor_y),
             yaw=float(self._last_matched_pose.yaw),
         )
 
@@ -325,9 +378,19 @@ class SourcceyLidarPointCloudAdapter(Module):
         best_x = float(seed_pose.x)
         best_y = float(seed_pose.y)
         best_yaw = float(seed_pose.yaw)
+        seed_sensor_x, seed_sensor_y = _sensor_origin_xy(
+            seed_pose,
+            mount_x_m=float(self.config.lidar_mount_x_m),
+            mount_y_m=float(self.config.lidar_mount_y_m),
+        )
         best_score = _scan_match_score(
             reference_world,
-            _transform_local_points(source_local, x=best_x, y=best_y, yaw=best_yaw),
+            _transform_local_points(
+                source_local,
+                x=seed_sensor_x,
+                y=seed_sensor_y,
+                yaw=best_yaw,
+            ),
         )
 
         translation_window = max(float(self.config.scan_match_translation_window_m), 0.02)
@@ -345,9 +408,17 @@ class SourcceyLidarPointCloudAdapter(Module):
                         cand_x = best_x + dx_idx * trans_step
                         cand_y = best_y + dy_idx * trans_step
                         cand_yaw = _wrap_angle_rad(best_yaw + dyaw_idx * yaw_step)
+                        sensor_x = cand_x + (
+                            float(self.config.lidar_mount_x_m) * math.cos(cand_yaw)
+                            - float(self.config.lidar_mount_y_m) * math.sin(cand_yaw)
+                        )
+                        sensor_y = cand_y + (
+                            float(self.config.lidar_mount_x_m) * math.sin(cand_yaw)
+                            + float(self.config.lidar_mount_y_m) * math.cos(cand_yaw)
+                        )
                         score = _scan_match_score(
                             reference_world,
-                            _transform_local_points(source_local, x=cand_x, y=cand_y, yaw=cand_yaw),
+                            _transform_local_points(source_local, x=sensor_x, y=sensor_y, yaw=cand_yaw),
                         )
                         if score < best_score:
                             best_score = score
@@ -446,6 +517,8 @@ class SourcceyLidarPointCloudAdapter(Module):
             forward_angle_deg=float(self.config.forward_angle_deg),
             valid_angle_half_width_deg=float(self.config.valid_angle_half_width_deg),
             invert_lateral_axis=bool(self.config.invert_lateral_axis),
+            lidar_mount_x_m=float(self.config.lidar_mount_x_m),
+            lidar_mount_y_m=float(self.config.lidar_mount_y_m),
             max_distance_m=float(self.config.max_distance_m),
             min_confidence=int(self.config.min_confidence),
             free_ray_step_m=float(self.config.free_ray_step_m),
@@ -465,15 +538,22 @@ class SourcceyLidarPointCloudAdapter(Module):
             z_height_m=float(self.config.registered_scan_height_m),
             frame_id=self.config.frame_id,
             timestamp=float(scan.ts),
+            lidar_mount_x_m=float(self.config.lidar_mount_x_m),
+            lidar_mount_y_m=float(self.config.lidar_mount_y_m),
         )
         self.registered_scan.publish(registered_scan)
         self._last_local_points = local_points_xy
         self._last_matched_pose = pose
         if local_points_xy.size != 0:
+            sensor_x, sensor_y = _sensor_origin_xy(
+                pose,
+                mount_x_m=float(self.config.lidar_mount_x_m),
+                mount_y_m=float(self.config.lidar_mount_y_m),
+            )
             world_points_xy = _transform_local_points(
                 local_points_xy,
-                x=float(pose.x),
-                y=float(pose.y),
+                x=float(sensor_x),
+                y=float(sensor_y),
                 yaw=float(pose.yaw),
             )
             self._update_submap(world_points_xy)

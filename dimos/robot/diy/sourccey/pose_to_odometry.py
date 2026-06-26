@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from reactivex.disposable import Disposable
@@ -16,6 +17,8 @@ from dimos.msgs.nav_msgs.Odometry import Odometry
 
 class SourcceyPoseToOdometryConfig(ModuleConfig):
     child_frame_id: str = "base_link"
+    lidar_mount_x_m: float = 0.0
+    lidar_mount_y_m: float = 0.0
 
 
 class SourcceyPoseToOdometry(Module):
@@ -34,13 +37,21 @@ class SourcceyPoseToOdometry(Module):
         super().stop()
 
     def _on_pose(self, msg: PoseStamped) -> None:
+        cos_yaw = math.cos(float(msg.yaw))
+        sin_yaw = math.sin(float(msg.yaw))
+        sensor_x = float(msg.x) + (float(self.config.lidar_mount_x_m) * cos_yaw) - (
+            float(self.config.lidar_mount_y_m) * sin_yaw
+        )
+        sensor_y = float(msg.y) + (float(self.config.lidar_mount_x_m) * sin_yaw) + (
+            float(self.config.lidar_mount_y_m) * cos_yaw
+        )
         self.odometry.publish(
             Odometry(
                 ts=float(msg.ts),
                 frame_id=str(msg.frame_id or "world"),
                 child_frame_id=str(self.config.child_frame_id),
                 pose=Pose(
-                    position=[float(msg.x), float(msg.y), float(msg.z)],
+                    position=[sensor_x, sensor_y, float(msg.z)],
                     orientation=[
                         float(msg.orientation.x),
                         float(msg.orientation.y),

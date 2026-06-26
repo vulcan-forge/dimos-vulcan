@@ -17,6 +17,8 @@ sourccey_lidar_mapping = autoconnect(
         forward_angle_deg=180.0,
         valid_angle_half_width_deg=90.0,
         invert_lateral_axis=True,
+        lidar_mount_x_m=0.2286,
+        lidar_mount_y_m=0.0,
         max_distance_m=8.0,
         min_confidence=5,
         free_ray_step_m=0.05,
@@ -25,7 +27,11 @@ sourccey_lidar_mapping = autoconnect(
         obstacle_height_m=0.25,
         odom_stale_after_s=0.75,
     ),
-    SourcceyPoseToOdometry.blueprint(),
+    SourcceyPoseToOdometry.blueprint(
+        child_frame_id="base_lidar",
+        lidar_mount_x_m=0.2286,
+        lidar_mount_y_m=0.0,
+    ),
     RayTracingVoxelMap.blueprint(
         voxel_size=0.05,
         max_range=8.0,
