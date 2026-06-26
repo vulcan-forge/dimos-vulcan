@@ -235,8 +235,12 @@ class WebsocketVisModule(Module):
         self.sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 
         async def serve_index(request):  # type: ignore[no-untyped-def]
-            """Always serve the lightweight Sourccey command center at root."""
-            return RedirectResponse(url="/command-center")
+            """Serve appropriate HTML based on viewer mode."""
+            if not (
+                self.config.g.viewer == "rerun" and self.config.g.rerun_open in ("web", "both")
+            ):
+                return RedirectResponse(url="/command-center")
+            return FileResponse(_DASHBOARD_HTML, media_type="text/html")
 
         async def serve_command_center(request):  # type: ignore[no-untyped-def]
             """Serve the lightweight Sourccey command center."""
