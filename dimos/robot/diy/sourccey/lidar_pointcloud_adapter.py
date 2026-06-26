@@ -25,6 +25,7 @@ logger = setup_logger()
 
 class SourcceyLidarPointCloudAdapterConfig(ModuleConfig):
     forward_angle_deg: float = 180.0
+    valid_angle_half_width_deg: float = 90.0
     max_distance_m: float = 8.0
     min_confidence: int = 0
     free_ray_step_m: float = 0.05
@@ -48,6 +49,7 @@ def _scan_to_local_points(
     scan: PlanarLidarScan,
     *,
     forward_angle_deg: float,
+    valid_angle_half_width_deg: float,
     max_distance_m: float,
     min_confidence: int,
 ) -> list[tuple[float, float, float, int]]:
@@ -65,6 +67,8 @@ def _scan_to_local_points(
         if not math.isfinite(distance) or distance <= 0.0 or distance > float(max_distance_m):
             continue
         delta_deg = normalize_angle_deg(float(angle_deg) - float(forward_angle_deg))
+        if abs(delta_deg) > float(valid_angle_half_width_deg):
+            continue
         theta_rad = math.radians(delta_deg)
         forward_m = distance * math.cos(theta_rad)
         lateral_m = distance * math.sin(theta_rad)
@@ -149,6 +153,7 @@ def build_pointcloud_from_scan(
     pose: PoseStamped,
     *,
     forward_angle_deg: float,
+    valid_angle_half_width_deg: float,
     max_distance_m: float,
     min_confidence: int,
     free_ray_step_m: float,
@@ -160,6 +165,7 @@ def build_pointcloud_from_scan(
     local_points = _scan_to_local_points(
         scan,
         forward_angle_deg=forward_angle_deg,
+        valid_angle_half_width_deg=valid_angle_half_width_deg,
         max_distance_m=max_distance_m,
         min_confidence=min_confidence,
     )
@@ -410,6 +416,7 @@ class SourcceyLidarPointCloudAdapter(Module):
         local_points = _scan_to_local_points(
             scan,
             forward_angle_deg=float(self.config.forward_angle_deg),
+            valid_angle_half_width_deg=float(self.config.valid_angle_half_width_deg),
             max_distance_m=float(self.config.max_distance_m),
             min_confidence=int(self.config.min_confidence),
         )
@@ -430,6 +437,7 @@ class SourcceyLidarPointCloudAdapter(Module):
             scan,
             pose,
             forward_angle_deg=float(self.config.forward_angle_deg),
+            valid_angle_half_width_deg=float(self.config.valid_angle_half_width_deg),
             max_distance_m=float(self.config.max_distance_m),
             min_confidence=int(self.config.min_confidence),
             free_ray_step_m=float(self.config.free_ray_step_m),

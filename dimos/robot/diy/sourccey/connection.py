@@ -72,6 +72,9 @@ class _ImuPacket:
     gx: float
     gy: float
     gz: float
+    mx: float | None = None
+    my: float | None = None
+    mz: float | None = None
 
 
 @dataclass(slots=True)
@@ -88,6 +91,7 @@ class _SlamOutputPacket:
     world_x: float
     world_y: float
     world_z: float
+    world_yaw_rad: float | None
     status: str
     detail: str
 
@@ -166,6 +170,9 @@ def _parse_slam_input_packet(payload: bytes) -> _SlamInputPacket:
                     gx=float(sample.get("gx", 0.0)),
                     gy=float(sample.get("gy", 0.0)),
                     gz=float(sample.get("gz", 0.0)),
+                    mx=None if sample.get("mx") is None else float(sample.get("mx", 0.0)),
+                    my=None if sample.get("my") is None else float(sample.get("my", 0.0)),
+                    mz=None if sample.get("mz") is None else float(sample.get("mz", 0.0)),
                 )
             )
 
@@ -184,10 +191,12 @@ def _parse_slam_output_packet(payload: bytes) -> _SlamOutputPacket:
         raise ValueError(f"Unsupported Sourccey output schema: {data.get('schema')}")
 
     pose = data.get("pose", {})
+    yaw_raw = pose.get("yaw_rad", pose.get("yaw", pose.get("theta")))
     return _SlamOutputPacket(
         world_x=float(pose.get("x", 0.0)),
         world_y=float(pose.get("y", 0.0)),
         world_z=float(pose.get("z", 0.0)),
+        world_yaw_rad=None if yaw_raw is None else _wrap_angle_rad(float(yaw_raw)),
         status=str(data.get("health", {}).get("status", "no_data")),
         detail=str(data.get("health", {}).get("detail", "")),
     )
@@ -202,6 +211,37 @@ def _quaternion_from_rpy_deg(rpy_deg: tuple[float, float, float]) -> Quaternion:
             math.radians(float(yaw_deg)),
         )
     )
+
+
+def _wrap_angle_rad(angle_rad: float) -> float:
+    return math.atan2(math.sin(angle_rad), math.cos(angle_rad))
+
+
+def _blend_angle_rad(
+    current_yaw_rad: float,
+    target_yaw_rad: float,
+    *,
+    alpha: float,
+    max_step_rad: float,
+) -> float:
+    alpha_clamped = float(np.clip(alpha, 0.0, 1.0))
+    if alpha_clamped <= 0.0:
+        return _wrap_angle_rad(current_yaw_rad)
+    delta = _wrap_angle_rad(float(target_yaw_rad) - float(current_yaw_rad))
+    step = float(np.clip(delta * alpha_clamped, -abs(max_step_rad), abs(max_step_rad)))
+    return _wrap_angle_rad(float(current_yaw_rad) + step)
+
+
+def _magnetometer_yaw_rad(sample: _ImuPacket) -> float | None:
+    if sample.mx is None or sample.my is None:
+        return None
+    mx = float(sample.mx)
+    my = float(sample.my)
+    if not math.isfinite(mx) or not math.isfinite(my):
+        return None
+    if math.hypot(mx, my) < 1e-6:
+        return None
+    return math.atan2(my, mx)
 
 
 def _parse_robot_observation(payload: bytes) -> _RobotObservationState:
@@ -371,6 +411,12 @@ class SourcceyConnectionConfig(ModuleConfig):
     camera_fov_axis: str = "horizontal"
     slam_output_stale_after_s: float = 0.75
     untorque_arms_during_base_control: bool = True
+    packet_pose_fresh_window_s: float = 0.35
+    imu_heading_correction_enabled: bool = True
+    imu_heading_alpha: float = 0.18
+    imu_heading_max_step_deg: float = 12.0
+    slam_heading_alpha: float = 0.75
+    slam_heading_max_step_deg: float = 20.0
     # Approximate multi-camera rig geometry for Sourccey.
     # These defaults are intentionally non-zero because the front cameras are not parallel,
     # and the bottom camera is pitched downward relative to the base.
@@ -413,6 +459,7 @@ class SourcceyConnection(Module, Camera, IMU):
         self._yaw_rad = 0.0
         self._last_packet_wall_ts: float | None = None
         self._last_slam_position_xy: tuple[float, float] | None = None
+        self._last_slam_yaw_rad: float | None = None
         self._last_slam_wall_ts: float | None = None
         self._latest_robot_state: _RobotObservationState | None = None
         self._latest_color_image: Image | None = None
@@ -648,6 +695,8 @@ class SourcceyConnection(Module, Camera, IMU):
                 float(slam_output.world_x),
                 float(slam_output.world_z),
             )
+            if slam_output.world_yaw_rad is not None:
+                self._last_slam_yaw_rad = float(slam_output.world_yaw_rad)
             self._last_slam_wall_ts = time.time()
 
     def _drain_observation_socket(self) -> None:
@@ -718,6 +767,35 @@ class SourcceyConnection(Module, Camera, IMU):
         )
         self._send_command_payload(payload)
 
+    def _apply_absolute_heading_corrections(
+        self,
+        *,
+        wall_ts: float,
+        imu_heading_rad: float | None = None,
+    ) -> None:
+        slam_heading_is_fresh = (
+            self._last_slam_yaw_rad is not None
+            and self._last_slam_wall_ts is not None
+            and (wall_ts - self._last_slam_wall_ts) <= float(self.config.slam_output_stale_after_s)
+        )
+        if slam_heading_is_fresh:
+            self._yaw_rad = _blend_angle_rad(
+                self._yaw_rad,
+                float(self._last_slam_yaw_rad),
+                alpha=float(self.config.slam_heading_alpha),
+                max_step_rad=math.radians(float(self.config.slam_heading_max_step_deg)),
+            )
+            return
+        if not bool(self.config.imu_heading_correction_enabled) or imu_heading_rad is None:
+            self._yaw_rad = _wrap_angle_rad(self._yaw_rad)
+            return
+        self._yaw_rad = _blend_angle_rad(
+            self._yaw_rad,
+            imu_heading_rad,
+            alpha=float(self.config.imu_heading_alpha),
+            max_step_rad=math.radians(float(self.config.imu_heading_max_step_deg)),
+        )
+
     def _publish_observation_pose(self, state: _RobotObservationState) -> None:
         wall_ts = time.time()
         dt = 0.0
@@ -725,8 +803,24 @@ class SourcceyConnection(Module, Camera, IMU):
             dt = max(0.0, min(wall_ts - self._last_observation_wall_ts, 0.25))
         self._last_observation_wall_ts = wall_ts
 
+        packet_pose_is_fresh = (
+            self._last_packet_wall_ts is not None
+            and (wall_ts - self._last_packet_wall_ts) <= float(self.config.packet_pose_fresh_window_s)
+        )
+        if packet_pose_is_fresh:
+            self.odom.publish(
+                PoseStamped(
+                    ts=wall_ts,
+                    frame_id="world",
+                    position=[float(self._dead_reckon_xy[0]), float(self._dead_reckon_xy[1]), 0.0],
+                    orientation=Quaternion.from_euler(Vector3(0.0, 0.0, self._yaw_rad)),
+                )
+            )
+            return
+
         theta_rate = float(state.theta_vel)
         self._yaw_rad += theta_rate * dt
+        self._apply_absolute_heading_corrections(wall_ts=wall_ts)
 
         slam_is_fresh = (
             self._last_slam_position_xy is not None
@@ -854,6 +948,14 @@ class SourcceyConnection(Module, Camera, IMU):
         elif packet.base_velocity:
             theta_rate = float(packet.base_velocity.get("theta.vel", 0.0))
         self._yaw_rad += theta_rate * dt
+        self._apply_absolute_heading_corrections(
+            wall_ts=wall_ts,
+            imu_heading_rad=(
+                _magnetometer_yaw_rad(packet.imu_samples[-1])
+                if packet.imu_samples
+                else None
+            )
+        )
 
         slam_is_fresh = (
             self._last_slam_position_xy is not None
