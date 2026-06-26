@@ -92,6 +92,8 @@ all_blueprints = {
     "sourccey-keyboard-teleop": "dimos.robot.diy.sourccey.blueprints.basic.sourccey_keyboard_teleop:sourccey_keyboard_teleop",
     "sourccey-lidar-keyboard-teleop": "dimos.robot.diy.sourccey.blueprints.basic.sourccey_lidar_keyboard_teleop:sourccey_lidar_keyboard_teleop",
     "sourccey-lidar-mapping": "dimos.robot.diy.sourccey.blueprints.smart.sourccey_lidar_mapping:sourccey_lidar_mapping",
+    "sourccey-lidar-mapping-offboard": "dimos.robot.diy.sourccey.blueprints.smart.sourccey_lidar_mapping_offboard:sourccey_lidar_mapping_offboard",
+    "sourccey-lidar-mapping-offboard-teleop": "dimos.robot.diy.sourccey.blueprints.smart.sourccey_lidar_mapping_offboard_teleop:sourccey_lidar_mapping_offboard_teleop",
     "sourccey-lidar-mapping-teleop": "dimos.robot.diy.sourccey.blueprints.smart.sourccey_lidar_mapping_teleop:sourccey_lidar_mapping_teleop",
     "sourccey-lidar-mapping-scan": "dimos.robot.diy.sourccey.blueprints.smart.sourccey_lidar_mapping_scan:sourccey_lidar_mapping_scan",
     "sourccey-spatial": "dimos.robot.diy.sourccey.blueprints.smart.sourccey_spatial:sourccey_spatial",

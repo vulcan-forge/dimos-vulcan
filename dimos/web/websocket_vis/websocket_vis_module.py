@@ -27,7 +27,6 @@ from pathlib import Path as FilePath
 import threading
 import time
 from typing import Any
-from urllib.parse import quote
 import webbrowser
 
 from dimos_lcm.std_msgs import Bool
@@ -236,10 +235,8 @@ class WebsocketVisModule(Module):
         self.sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
 
         async def serve_index(request):  # type: ignore[no-untyped-def]
-            """Redirect root directly to the live Rerun web viewer."""
-            hostname = request.url.hostname or "127.0.0.1"
-            rerun_url = f"http://{hostname}:9878/?url={quote(f'rerun+http://{hostname}:9877/proxy', safe='')}"
-            return RedirectResponse(url=rerun_url)
+            """Serve the dashboard HTML at root."""
+            return FileResponse(_DASHBOARD_HTML, media_type="text/html")
 
         async def serve_command_center(request):  # type: ignore[no-untyped-def]
             """Serve the lightweight Sourccey command center."""

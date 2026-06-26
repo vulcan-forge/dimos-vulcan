@@ -1982,6 +1982,7 @@ dependencies = [
     { name = "psutil" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "pyserial" },
     { name = "python-dotenv" },
     { name = "pyturbojpeg" },
     { name = "reactivex" },
@@ -2470,6 +2471,7 @@ requires-dist = [
     { name = "pygame", marker = "extra == 'sim'", specifier = ">=2.6.1" },
     { name = "pymavlink", marker = "extra == 'drone'" },
     { name = "pyrealsense2-extended", marker = "sys_platform != 'darwin' and extra == 'manipulation'" },
+    { name = "pyserial", specifier = ">=3.5" },
     { name = "python-dotenv" },
     { name = "python-multipart", marker = "extra == 'misc'", specifier = ">=0.0.27" },
     { name = "pyturbojpeg", specifier = "==1.8.2" },
@@ -8888,6 +8890,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/ef/87/d984709551da486736a641c7c3dc376f5c76cdf936818864329216c46b37/pyrealsense2_extended-2.58.1.10581.post1-cp314-cp314-manylinux1_x86_64.whl", hash = "sha256:8140be678f6b6219c54a9ea67a50e6c8ccbbec47fced8d9565df78762c964b54", size = 12849959, upload-time = "2026-05-31T20:50:16.352Z" },
     { url = "https://files.pythonhosted.org/packages/43/fb/a740f2ff2c6b63bd8d5ebd31870f776b2e4e0812f539df4b9f250ab166ed/pyrealsense2_extended-2.58.1.10581.post1-cp314-cp314-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:a07f27b3905b7fe277c06a365c5776896fdb48e40d25e951b7da6cfa1899a5b0", size = 6346254, upload-time = "2026-05-31T20:50:18.112Z" },
     { url = "https://files.pythonhosted.org/packages/df/9c/484d914f28d88a441c053b3ced903fb034ace61812c32f3fe785cbe53b97/pyrealsense2_extended-2.58.1.10581.post1-cp314-cp314-win_amd64.whl", hash = "sha256:3a2d5a9ac8894d7a14fdf26a9763830f930f7c7a205c254be04d5880231261d0", size = 8754378, upload-time = "2026-05-31T20:50:19.419Z" },
+]
+
+[[package]]
+name = "pyserial"
+version = "3.5"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1e/7d/ae3f0a63f41e4d2f6cb66a5b57197850f919f59e558159a4dd3a818f5082/pyserial-3.5.tar.gz", hash = "sha256:3c77e014170dfffbd816e6ffc205e9842efb10be9f58ec16d3e8675b4925cddb", size = 159125, upload-time = "2020-11-23T03:59:15.045Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/07/bc/587a445451b253b285629263eb51c2d8e9bcea4fc97826266d186f96f558/pyserial-3.5-py2.py3-none-any.whl", hash = "sha256:c4451db6ba391ca6ca299fb3ec7bae67a5c55dde170964c7a14ceefec02f2cf0", size = 90585, upload-time = "2020-11-23T03:59:13.41Z" },
 ]
 
 [[package]]

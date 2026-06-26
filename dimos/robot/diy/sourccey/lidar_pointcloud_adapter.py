@@ -46,6 +46,17 @@ class SourcceyLidarPointCloudAdapterConfig(ModuleConfig):
     scan_match_accept_score_m: float = 0.12
     submap_max_points: int = 1600
     registered_scan_height_m: float = 0.32
+    reset_context_translation_m: float = 0.35
+    reset_context_rotation_deg: float = 30.0
+    min_points_for_scan_match: int = 40
+    max_odom_angular_speed_for_mapping_rad_s: float = 0.30
+    max_odom_linear_speed_for_mapping_m_s: float = 0.20
+    mapping_holdoff_after_turn_s: float = 0.35
+    obstacle_memory_enabled: bool = True
+    obstacle_memory_decay_s: float = 3600.0
+    obstacle_memory_max_points: int = 8000
+    obstacle_memory_voxel_m: float = 0.04
+    obstacle_memory_height_m: float = 0.32
 
 
 def _scan_to_local_points(
@@ -321,14 +332,19 @@ class SourcceyLidarPointCloudAdapter(Module):
     lidar: Out[PointCloud2]
     registered_scan: Out[PointCloud2]
     localized_pose: Out[PoseStamped]
+    obstacle_memory: Out[PointCloud2]
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._latest_odom: PoseStamped | None = None
+        self._prev_odom: PoseStamped | None = None
         self._scan_count = 0
         self._last_local_points: np.ndarray | None = None
         self._last_matched_pose: PoseStamped | None = None
         self._submap_points_world = np.zeros((0, 2), dtype=np.float32)
+        self._last_turn_motion_wall_ts: float | None = None
+        self._obstacle_memory_points_xy = np.zeros((0, 2), dtype=np.float32)
+        self._obstacle_memory_timestamps = np.zeros((0,), dtype=np.float64)
 
     @rpc
     def start(self) -> None:
@@ -341,7 +357,28 @@ class SourcceyLidarPointCloudAdapter(Module):
         super().stop()
 
     def _on_odom(self, msg: PoseStamped) -> None:
+        if self._latest_odom is not None:
+            prev = self._latest_odom
+            dt = max(float(msg.ts) - float(prev.ts), 1e-3)
+            dyaw = _wrap_angle_rad(float(msg.yaw) - float(prev.yaw))
+            angular_speed = abs(float(dyaw) / dt)
+            dx = float(msg.x) - float(prev.x)
+            dy = float(msg.y) - float(prev.y)
+            linear_speed = math.hypot(dx, dy) / dt
+            if (
+                angular_speed > float(self.config.max_odom_angular_speed_for_mapping_rad_s)
+                or linear_speed > float(self.config.max_odom_linear_speed_for_mapping_m_s)
+            ):
+                self._last_turn_motion_wall_ts = time.time()
+        self._prev_odom = self._latest_odom
         self._latest_odom = msg
+
+    def _hold_mapping_for_turn(self) -> bool:
+        if self._last_turn_motion_wall_ts is None:
+            return False
+        return (time.time() - float(self._last_turn_motion_wall_ts)) < float(
+            self.config.mapping_holdoff_after_turn_s
+        )
 
     def _reference_world_points(self) -> np.ndarray:
         if self._submap_points_world.size != 0:
@@ -358,6 +395,25 @@ class SourcceyLidarPointCloudAdapter(Module):
             x=float(sensor_x),
             y=float(sensor_y),
             yaw=float(self._last_matched_pose.yaw),
+        )
+
+    def _clear_match_context(self) -> None:
+        self._last_local_points = None
+        self._last_matched_pose = None
+        self._submap_points_world = np.zeros((0, 2), dtype=np.float32)
+
+    def _should_reset_match_context(self, seed_pose: PoseStamped) -> bool:
+        if self._last_matched_pose is None:
+            return False
+        dx = float(seed_pose.x) - float(self._last_matched_pose.x)
+        dy = float(seed_pose.y) - float(self._last_matched_pose.y)
+        distance_m = math.hypot(dx, dy)
+        yaw_delta_deg = abs(
+            math.degrees(_wrap_angle_rad(float(seed_pose.yaw) - float(self._last_matched_pose.yaw)))
+        )
+        return (
+            distance_m > float(self.config.reset_context_translation_m)
+            or yaw_delta_deg > float(self.config.reset_context_rotation_deg)
         )
 
     def _refine_pose_with_scan_match(
@@ -454,11 +510,24 @@ class SourcceyLidarPointCloudAdapter(Module):
             logger.debug("Skipping Sourccey LiDAR scan because odom is stale")
             return None, False, None
 
+        if self._should_reset_match_context(odom):
+            logger.info(
+                "Resetting LiDAR scan-match context after large pose delta",
+                odom_x=round(float(odom.x), 3),
+                odom_y=round(float(odom.y), 3),
+                odom_yaw_deg=round(math.degrees(float(odom.yaw)), 1),
+            )
+            self._clear_match_context()
+
+        if self._hold_mapping_for_turn():
+            return None, False, None
+
         if (
             not bool(self.config.scan_match_enabled)
             or self._last_local_points is None
             or self._last_matched_pose is None
             or local_points_xy.size == 0
+            or len(local_points_xy) < int(self.config.min_points_for_scan_match)
         ):
             return odom, True, None
 
@@ -473,6 +542,7 @@ class SourcceyLidarPointCloudAdapter(Module):
             reference_world=reference_world,
         )
         if refined_pose is None:
+            self._clear_match_context()
             return odom, False, score
         return refined_pose, True, score
 
@@ -488,6 +558,97 @@ class SourcceyLidarPointCloudAdapter(Module):
             merged,
             max(int(self.config.submap_max_points), int(self.config.scan_match_max_points)),
         )
+
+    def _publish_obstacle_memory(self, timestamp: float, *, visible_points_xy: np.ndarray | None = None) -> None:
+        if not bool(self.config.obstacle_memory_enabled):
+            return
+        memory_points_xy = self._obstacle_memory_points_xy
+        if visible_points_xy is not None and visible_points_xy.size != 0 and memory_points_xy.size != 0:
+            voxel = max(float(self.config.obstacle_memory_voxel_m), 1e-3)
+            visible_cells = {
+                tuple(cell)
+                for cell in np.round(visible_points_xy / voxel).astype(np.int32, copy=False).tolist()
+            }
+            if visible_cells:
+                memory_cells = np.round(memory_points_xy / voxel).astype(np.int32, copy=False)
+                keep_mask = np.asarray(
+                    [tuple(cell.tolist()) not in visible_cells for cell in memory_cells],
+                    dtype=bool,
+                )
+                memory_points_xy = memory_points_xy[keep_mask]
+
+        if memory_points_xy.size == 0:
+            self.obstacle_memory.publish(
+                PointCloud2.from_numpy(
+                    np.zeros((0, 3), dtype=np.float32),
+                    frame_id=self.config.frame_id,
+                    timestamp=float(timestamp),
+                )
+            )
+            return
+        points_xyz = np.column_stack(
+            (
+                memory_points_xy[:, 0],
+                memory_points_xy[:, 1],
+                np.full(
+                    (len(memory_points_xy),),
+                    float(self.config.obstacle_memory_height_m),
+                    dtype=np.float32,
+                ),
+            )
+        ).astype(np.float32, copy=False)
+        self.obstacle_memory.publish(
+            PointCloud2.from_numpy(
+                points_xyz,
+                frame_id=self.config.frame_id,
+                timestamp=float(timestamp),
+            )
+        )
+
+    def _update_obstacle_memory(self, world_points_xy: np.ndarray, *, timestamp: float) -> None:
+        if not bool(self.config.obstacle_memory_enabled):
+            return
+
+        now = float(timestamp)
+        if self._obstacle_memory_timestamps.size != 0:
+            keep_mask = (now - self._obstacle_memory_timestamps) <= float(self.config.obstacle_memory_decay_s)
+            self._obstacle_memory_points_xy = self._obstacle_memory_points_xy[keep_mask]
+            self._obstacle_memory_timestamps = self._obstacle_memory_timestamps[keep_mask]
+
+        if world_points_xy.size != 0:
+            if self._obstacle_memory_points_xy.size == 0:
+                merged_points = world_points_xy.astype(np.float32, copy=True)
+                merged_timestamps = np.full((len(world_points_xy),), now, dtype=np.float64)
+            else:
+                merged_points = np.vstack((self._obstacle_memory_points_xy, world_points_xy)).astype(
+                    np.float32,
+                    copy=False,
+                )
+                merged_timestamps = np.concatenate(
+                    (
+                        self._obstacle_memory_timestamps,
+                        np.full((len(world_points_xy),), now, dtype=np.float64),
+                    )
+                )
+
+            voxel = max(float(self.config.obstacle_memory_voxel_m), 1e-3)
+            quantized = np.round(merged_points / voxel).astype(np.int64, copy=False)
+            # Collapse to one point per voxel cell, keeping the most recently
+            # observed point in each cell. Sorting by timestamp ascending and then
+            # taking the last occurrence per unique cell yields the newest sample.
+            order_by_ts = np.argsort(merged_timestamps, kind="stable")
+            cells_sorted = quantized[order_by_ts]
+            _, last_in_reversed = np.unique(cells_sorted[::-1], axis=0, return_index=True)
+            keep_indices = order_by_ts[len(cells_sorted) - 1 - last_in_reversed]
+            if keep_indices.size != 0:
+                order = np.argsort(merged_timestamps[keep_indices])[::-1]
+                keep_indices = keep_indices[order]
+                max_points = max(int(self.config.obstacle_memory_max_points), 1)
+                keep_indices = keep_indices[:max_points]
+                self._obstacle_memory_points_xy = merged_points[keep_indices]
+                self._obstacle_memory_timestamps = merged_timestamps[keep_indices]
+
+        self._publish_obstacle_memory(timestamp, visible_points_xy=world_points_xy)
 
     def _on_scan(self, scan: PlanarLidarScan) -> None:
         local_points = _scan_to_local_points(
@@ -506,6 +667,14 @@ class SourcceyLidarPointCloudAdapter(Module):
 
         pose, accepted, score = self._resolve_scan_pose(scan, local_points_xy)
         if pose is None:
+            if self._hold_mapping_for_turn():
+                self._scan_count += 1
+                if self._scan_count % max(int(self.config.log_every_scans), 1) == 0:
+                    logger.info(
+                        "Holding LiDAR map insertion during turn stabilization",
+                        holdoff_s=round(float(self.config.mapping_holdoff_after_turn_s), 3),
+                    )
+                self._update_obstacle_memory(np.zeros((0, 2), dtype=np.float32), timestamp=float(scan.ts))
             return
         if not accepted and score is not None:
             logger.debug("Skipping LiDAR frame after failed scan match score=%.4f", float(score))
@@ -557,6 +726,9 @@ class SourcceyLidarPointCloudAdapter(Module):
                 yaw=float(pose.yaw),
             )
             self._update_submap(world_points_xy)
+            self._update_obstacle_memory(world_points_xy, timestamp=float(scan.ts))
+        else:
+            self._update_obstacle_memory(np.zeros((0, 2), dtype=np.float32), timestamp=float(scan.ts))
         self._scan_count += 1
         if self._scan_count % max(int(self.config.log_every_scans), 1) == 0:
             logger.info(

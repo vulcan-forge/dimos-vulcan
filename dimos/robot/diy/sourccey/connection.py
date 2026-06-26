@@ -417,6 +417,8 @@ class SourcceyConnectionConfig(ModuleConfig):
     imu_heading_max_step_deg: float = 12.0
     slam_heading_alpha: float = 0.75
     slam_heading_max_step_deg: float = 20.0
+    invert_yaw_sign: bool = True
+    localized_pose_fresh_window_s: float = 0.6
     # Approximate multi-camera rig geometry for Sourccey.
     # These defaults are intentionally non-zero because the front cameras are not parallel,
     # and the bottom camera is pitched downward relative to the base.
@@ -434,6 +436,7 @@ class SourcceyConnection(Module, Camera, IMU):
     config: SourcceyConnectionConfig
 
     cmd_vel: In[Twist]
+    localized_pose: In[PoseStamped]
     color_image: Out[Image]
     camera_info: Out[CameraInfo]
     companion_image: Out[Image]
@@ -464,6 +467,16 @@ class SourcceyConnection(Module, Camera, IMU):
         self._latest_robot_state: _RobotObservationState | None = None
         self._latest_color_image: Image | None = None
         self._last_observation_wall_ts: float | None = None
+        self._packets_with_imu = 0
+        self._packets_without_imu = 0
+        self._logged_imu_present = False
+        self._latest_localized_pose: PoseStamped | None = None
+
+    def _signed_yaw(self, value: float | None) -> float | None:
+        if value is None:
+            return None
+        signed = -float(value) if bool(self.config.invert_yaw_sign) else float(value)
+        return _wrap_angle_rad(signed)
 
     @rpc
     def start(self) -> None:
@@ -485,6 +498,7 @@ class SourcceyConnection(Module, Camera, IMU):
         )
         self._pump_thread.start()
         self.register_disposable(Disposable(self.cmd_vel.subscribe(self._on_cmd_vel)))
+        self.register_disposable(Disposable(self.localized_pose.subscribe(self._on_localized_pose)))
         logger.info(
             "SourcceyConnection started",
             input_endpoint=self.config.slam_input_endpoint,
@@ -526,6 +540,9 @@ class SourcceyConnection(Module, Camera, IMU):
             angular_z=round(float(msg.angular.z), 4),
         )
         self.move(msg)
+
+    def _on_localized_pose(self, msg: PoseStamped) -> None:
+        self._latest_localized_pose = msg
 
 
     @rpc
@@ -696,7 +713,8 @@ class SourcceyConnection(Module, Camera, IMU):
                 float(slam_output.world_z),
             )
             if slam_output.world_yaw_rad is not None:
-                self._last_slam_yaw_rad = float(slam_output.world_yaw_rad)
+                signed_yaw = self._signed_yaw(float(slam_output.world_yaw_rad))
+                self._last_slam_yaw_rad = None if signed_yaw is None else float(signed_yaw)
             self._last_slam_wall_ts = time.time()
 
     def _drain_observation_socket(self) -> None:
@@ -818,7 +836,7 @@ class SourcceyConnection(Module, Camera, IMU):
             )
             return
 
-        theta_rate = float(state.theta_vel)
+        theta_rate = float(self._signed_yaw(float(state.theta_vel)) or 0.0)
         self._yaw_rad += theta_rate * dt
         self._apply_absolute_heading_corrections(wall_ts=wall_ts)
 
@@ -847,6 +865,21 @@ class SourcceyConnection(Module, Camera, IMU):
         self.odom.publish(pose)
 
     def _publish_packet(self, packet: _SlamInputPacket) -> None:
+        if packet.imu_samples:
+            self._packets_with_imu += 1
+            if not self._logged_imu_present:
+                logger.info(
+                    "SourcceyConnection receiving IMU samples for heading fusion",
+                    samples_in_packet=len(packet.imu_samples),
+                )
+                self._logged_imu_present = True
+        else:
+            self._packets_without_imu += 1
+            if self._packets_without_imu % 60 == 0:
+                logger.warning(
+                    "SourcceyConnection has not received IMU samples; turn-in-place mapping will drift badly"
+                )
+
         primary_frame = self._get_camera(packet, self.config.primary_camera_key)
         if primary_frame is None:
             return
@@ -944,14 +977,14 @@ class SourcceyConnection(Module, Camera, IMU):
 
         theta_rate = 0.0
         if packet.imu_samples:
-            theta_rate = float(packet.imu_samples[-1].gz)
+            theta_rate = float(self._signed_yaw(float(packet.imu_samples[-1].gz)) or 0.0)
         elif packet.base_velocity:
-            theta_rate = float(packet.base_velocity.get("theta.vel", 0.0))
+            theta_rate = float(self._signed_yaw(float(packet.base_velocity.get("theta.vel", 0.0))) or 0.0)
         self._yaw_rad += theta_rate * dt
         self._apply_absolute_heading_corrections(
             wall_ts=wall_ts,
             imu_heading_rad=(
-                _magnetometer_yaw_rad(packet.imu_samples[-1])
+                self._signed_yaw(_magnetometer_yaw_rad(packet.imu_samples[-1]))
                 if packet.imu_samples
                 else None
             )
@@ -984,49 +1017,56 @@ class SourcceyConnection(Module, Camera, IMU):
     def _publish_pose_and_tf(self, pose: PoseStamped) -> None:
         self.odom.publish(pose)
 
+        tf_pose = pose
+        localized_pose = self._latest_localized_pose
+        if localized_pose is not None:
+            age_s = abs(float(pose.ts) - float(localized_pose.ts))
+            if age_s <= float(self.config.localized_pose_fresh_window_s):
+                tf_pose = localized_pose
+
         self.tf.publish(
-            Transform.from_pose("base_link", pose),
+            Transform.from_pose("base_link", tf_pose),
             Transform(
                 translation=Vector3(*self.config.front_camera_xyz_m),
                 rotation=_quaternion_from_rpy_deg(self.config.front_camera_rpy_deg),
                 frame_id="base_link",
                 child_frame_id="camera_link",
-                ts=pose.ts,
+                ts=tf_pose.ts,
             ),
             Transform(
                 translation=Vector3(0.0, 0.0, 0.0),
                 rotation=_OPTICAL_ROTATION,
                 frame_id="camera_link",
                 child_frame_id="camera_optical",
-                ts=pose.ts,
+                ts=tf_pose.ts,
             ),
             Transform(
                 translation=Vector3(*self.config.companion_camera_xyz_m),
                 rotation=_quaternion_from_rpy_deg(self.config.companion_camera_rpy_deg),
                 frame_id="base_link",
                 child_frame_id="companion_camera_link",
-                ts=pose.ts,
+                ts=tf_pose.ts,
             ),
             Transform(
                 translation=Vector3(0.0, 0.0, 0.0),
                 rotation=_OPTICAL_ROTATION,
                 frame_id="companion_camera_link",
                 child_frame_id="companion_camera_optical",
-                ts=pose.ts,
+                ts=tf_pose.ts,
             ),
             Transform(
                 translation=Vector3(*self.config.bottom_camera_xyz_m),
                 rotation=_quaternion_from_rpy_deg(self.config.bottom_camera_rpy_deg),
                 frame_id="base_link",
                 child_frame_id="bottom_camera_link",
-                ts=pose.ts,
+                ts=tf_pose.ts,
             ),
             Transform(
                 translation=Vector3(0.0, 0.0, 0.0),
                 rotation=_OPTICAL_ROTATION,
                 frame_id="bottom_camera_link",
                 child_frame_id="bottom_camera_optical",
-                ts=pose.ts,
+                ts=tf_pose.ts,
             ),
         )
 
