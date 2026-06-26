@@ -3,11 +3,12 @@ from __future__ import annotations
 from dimos.core.coordination.blueprints import autoconnect
 from dimos.mapping.costmapper import CostMapper
 from dimos.mapping.pointclouds.occupancy import SimpleOccupancyConfig
-from dimos.mapping.voxels import VoxelGridMapper
+from dimos.mapping.ray_tracing.module import RayTracingVoxelMap
 from dimos.robot.diy.sourccey.blueprints.basic.sourccey_basic import sourccey_basic
 from dimos.robot.diy.sourccey.lidar_pointcloud_adapter import SourcceyLidarPointCloudAdapter
 from dimos.robot.diy.sourccey.lidar_scan_publisher import SourcceyLidarScanPublisher
 from dimos.robot.diy.sourccey.occupancy_grid_exporter import SourcceyOccupancyGridExporter
+from dimos.robot.diy.sourccey.pose_to_odometry import SourcceyPoseToOdometry
 
 sourccey_lidar_mapping = autoconnect(
     sourccey_basic,
@@ -22,20 +23,33 @@ sourccey_lidar_mapping = autoconnect(
         obstacle_height_m=0.25,
         odom_stale_after_s=0.75,
     ),
-    VoxelGridMapper.blueprint(
+    SourcceyPoseToOdometry.blueprint(),
+    RayTracingVoxelMap.blueprint(
         voxel_size=0.05,
-        carve_columns=True,
-        frame_id="world",
-        device="CPU:0",
+        max_range=8.0,
+        ray_subsample=1,
+        shadow_depth=0.05,
+        grace_depth=0.05,
+        min_health=-1,
+        max_health=1,
+        recency_window=4,
     ),
     CostMapper.blueprint(
         algo="simple",
         config=SimpleOccupancyConfig(
             resolution=0.05,
             frame_id="world",
-            min_height=0.10,
-            max_height=0.60,
+            min_height=0.08,
+            max_height=0.40,
         ),
+        initial_safe_radius_meters=0.30,
     ),
     SourcceyOccupancyGridExporter.blueprint(),
+).remappings(
+    [
+        (SourcceyPoseToOdometry, "pose", "localized_pose"),
+        (SourcceyPoseToOdometry, "odometry", "localized_odometry"),
+        (RayTracingVoxelMap, "odometry", "localized_odometry"),
+        (SourcceyOccupancyGridExporter, "odom", "localized_pose"),
+    ]
 ).global_config(n_workers=8)
