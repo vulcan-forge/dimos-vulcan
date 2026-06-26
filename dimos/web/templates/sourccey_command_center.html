@@ -7,52 +7,88 @@
     <style>
         :root {
             color-scheme: dark;
-            --bg: #06090f;
-            --panel: #111722;
-            --panel-2: #0c121b;
+            --bg: #070b11;
+            --panel: #101722;
             --border: #253043;
             --text: #eef4ff;
             --muted: #9fb0c8;
-            --good: #2bb673;
-            --warn: #ffb020;
-            --danger: #ff5d5d;
             --accent: #4da3ff;
+            --good: #155e42;
+            --warn: #6c4a06;
+            --danger: #6f1f1f;
         }
         * { box-sizing: border-box; }
         body {
             margin: 0;
             min-height: 100vh;
-            background:
-                radial-gradient(circle at top, rgba(77, 163, 255, 0.14), transparent 35%),
-                linear-gradient(180deg, #0b111a 0%, var(--bg) 100%);
+            background: linear-gradient(180deg, #0b111a 0%, var(--bg) 100%);
             color: var(--text);
             font-family: "Segoe UI", "Aptos", system-ui, sans-serif;
         }
         .wrap {
             display: flex;
             flex-direction: column;
-            gap: 14px;
-            padding: 14px;
-            height: 100vh;
+            gap: 12px;
+            padding: 12px;
+            min-height: 100vh;
         }
         .card {
             background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
             border: 1px solid var(--border);
             border-radius: 14px;
             padding: 14px;
-            box-shadow: 0 14px 40px rgba(0, 0, 0, 0.22);
         }
         h1 {
             margin: 0 0 6px;
-            font-size: 1.1rem;
-            letter-spacing: 0.02em;
+            font-size: 1.08rem;
         }
         .sub {
             color: var(--muted);
-            font-size: 0.92rem;
+            font-size: 0.9rem;
             line-height: 1.4;
         }
-        .row {
+        .map-shell {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 300px;
+            background: #05070b;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+            margin-top: 12px;
+        }
+        .map-shell img {
+            display: block;
+            max-width: 100%;
+            height: auto;
+            image-rendering: pixelated;
+            background: #7f7f7f;
+        }
+        .status {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
+            margin-top: 12px;
+        }
+        .pill {
+            background: #0d1520;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 10px 12px;
+        }
+        .label {
+            color: var(--muted);
+            font-size: 0.76rem;
+            margin-bottom: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+        .value {
+            font-size: 0.96rem;
+            font-weight: 700;
+        }
+        .row, .controls {
             display: flex;
             flex-wrap: wrap;
             gap: 10px;
@@ -69,64 +105,27 @@
             font-weight: 600;
             cursor: pointer;
         }
-        button:hover { filter: brightness(1.08); }
+        button.good { background: var(--good); }
+        button.warn { background: var(--warn); }
+        button.danger { background: var(--danger); }
         button.secondary { background: #1a2230; }
-        button.good { background: #155e42; }
-        button.warn { background: #6c4a06; }
-        button.danger { background: #6f1f1f; }
         button.active {
             outline: 2px solid var(--accent);
-            box-shadow: 0 0 0 4px rgba(77, 163, 255, 0.2);
+            box-shadow: 0 0 0 4px rgba(77, 163, 255, 0.18);
         }
-        .status {
+        .pad {
             display: grid;
-            grid-template-columns: repeat(2, minmax(0, 1fr));
-            gap: 10px;
-            margin-top: 12px;
-        }
-        .pill {
-            background: var(--panel-2);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            padding: 10px 12px;
-        }
-        .label {
-            color: var(--muted);
-            font-size: 0.8rem;
-            margin-bottom: 4px;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-        }
-        .value {
-            font-size: 0.98rem;
-            font-weight: 700;
-        }
-        .keys {
-            display: grid;
-            grid-template-columns: repeat(3, minmax(0, 1fr));
+            grid-template-columns: repeat(3, minmax(0, 88px));
             gap: 8px;
-            max-width: 240px;
             margin-top: 12px;
         }
-        .key {
-            background: #0d1520;
-            border: 1px solid var(--border);
-            border-radius: 10px;
-            padding: 12px 8px;
-            text-align: center;
-            color: var(--muted);
-            font-weight: 700;
-        }
-        .key.active {
-            background: rgba(77, 163, 255, 0.2);
-            border-color: var(--accent);
-            color: var(--text);
+        .drive {
+            min-height: 56px;
         }
         .footer {
-            margin-top: auto;
             color: var(--muted);
-            font-size: 0.84rem;
-            line-height: 1.45;
+            font-size: 0.82rem;
+            line-height: 1.4;
         }
         @media (max-width: 800px) {
             .status { grid-template-columns: 1fr; }
@@ -138,16 +137,17 @@
         <div class="card">
             <h1>Sourccey Command Center</h1>
             <div class="sub">
-                Click <strong>Start Keyboard Control</strong>, then use <strong>W/S</strong> for forward and back,
-                <strong>A/D</strong> for strafe, and <strong>Z/X</strong> for rotate.
-                This page sends direct motion commands into the same Dimos teleop stream the mapper uses.
+                This is the exported occupancy map view, not the rainbow costmap overlay.
+                Use <strong>Start Keyboard Control</strong> and then <strong>W/S</strong> forward/back,
+                <strong>A/D</strong> strafe, <strong>Z/X</strong> rotate.
+                If web driving still does nothing, make sure DimOS is running
+                <code>sourccey-lidar-mapping-teleop</code>, not plain <code>sourccey-lidar-mapping</code>.
             </div>
-            <div class="row">
-                <button id="keyboardToggle" class="good">Start Keyboard Control</button>
-                <button id="stopMotion" class="danger">Stop Motion</button>
-                <button id="startExplore" class="secondary">Start Exploration</button>
-                <button id="stopExplore" class="warn">Stop Exploration</button>
+
+            <div class="map-shell">
+                <img id="mapImage" alt="Latest occupancy map" />
             </div>
+
             <div class="status">
                 <div class="pill">
                     <div class="label">Keyboard</div>
@@ -157,21 +157,40 @@
                     <div class="label">Last Command</div>
                     <div id="commandStatus" class="value">x=0.00 y=0.00 yaw=0.00</div>
                 </div>
+                <div class="pill">
+                    <div class="label">Pose</div>
+                    <div id="poseStatus" class="value">waiting for map...</div>
+                </div>
+                <div class="pill">
+                    <div class="label">Map Counts</div>
+                    <div id="mapCounts" class="value">waiting for map...</div>
+                </div>
             </div>
-            <div class="keys">
-                <div class="key" data-key="a">A Strafe</div>
-                <div class="key" data-key="w">W Forward</div>
-                <div class="key" data-key="d">D Strafe</div>
-                <div class="key" data-key="z">Z Rotate</div>
-                <div class="key" data-key="s">S Back</div>
-                <div class="key" data-key="x">X Rotate</div>
+
+            <div class="row">
+                <button id="keyboardToggle" class="good">Start Keyboard Control</button>
+                <button id="stopMotion" class="danger">Stop Motion</button>
+                <button id="startExplore" class="secondary">Start Exploration</button>
+                <button id="stopExplore" class="warn">Stop Exploration</button>
+            </div>
+
+            <div class="pad">
+                <div></div>
+                <button class="drive" data-hold="w">W Forward</button>
+                <div></div>
+                <button class="drive" data-hold="a">A Left</button>
+                <button class="drive" data-hold="s">S Back</button>
+                <button class="drive" data-hold="d">D Right</button>
+                <button class="drive" data-hold="z">Z Turn Left</button>
+                <button class="drive" data-hold="x">X Turn Right</button>
+                <div></div>
             </div>
         </div>
+
         <div class="footer">
-            If the robot still does not move, watch the Pi terminal for:
-            <code>Received web move_command</code>,
-            <code>LidarSafetyGate pass-through</code>,
-            and <code>Sending Sourccey base command</code>.
+            Watch the Pi log for <code>Received web move_command</code>, then
+            <code>LidarSafetyGate pass-through</code>, then <code>Sending Sourccey base command</code>.
+            If you only see the first line, you started the wrong blueprint.
         </div>
     </div>
     <script>
@@ -179,15 +198,16 @@
             const moveEndpoint = "/api/move";
             const startExploreEndpoint = "/api/start-explore";
             const stopExploreEndpoint = "/api/stop-explore";
+            const mapImage = document.getElementById("mapImage");
             const keyboardToggle = document.getElementById("keyboardToggle");
             const stopMotionButton = document.getElementById("stopMotion");
             const startExploreButton = document.getElementById("startExplore");
             const stopExploreButton = document.getElementById("stopExplore");
             const keyboardStatus = document.getElementById("keyboardStatus");
             const commandStatus = document.getElementById("commandStatus");
-            const keyEls = new Map(
-                Array.from(document.querySelectorAll("[data-key]")).map((el) => [el.dataset.key, el])
-            );
+            const poseStatus = document.getElementById("poseStatus");
+            const mapCounts = document.getElementById("mapCounts");
+            const holdButtons = Array.from(document.querySelectorAll("[data-hold]"));
 
             const SPEEDS = {
                 linear: 0.9,
@@ -199,29 +219,21 @@
             let enabled = false;
             let timer = null;
 
-            function updateKeyboardUi() {
-                keyboardStatus.textContent = enabled ? "ENABLED" : "DISABLED";
-                keyboardToggle.textContent = enabled ? "Disable Keyboard Control" : "Start Keyboard Control";
-                keyboardToggle.classList.toggle("active", enabled);
-                keyEls.forEach((el, key) => {
-                    const aliases = aliasKeysForDisplay(key);
-                    const active = aliases.some((alias) => pressed.has(alias));
-                    el.classList.toggle("active", active);
-                });
-            }
-
-            function aliasKeysForDisplay(key) {
-                return [key];
-            }
-
             async function postJson(url, body) {
                 const response = await fetch(url, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify(body),
                 });
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}`);
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            }
+
+            function updateKeyboardUi() {
+                keyboardStatus.textContent = enabled ? "ENABLED" : "DISABLED";
+                keyboardToggle.textContent = enabled ? "Disable Keyboard Control" : "Start Keyboard Control";
+                keyboardToggle.classList.toggle("active", enabled);
+                for (const button of holdButtons) {
+                    button.classList.toggle("active", pressed.has(button.dataset.hold));
                 }
             }
 
@@ -264,8 +276,9 @@
             function startLoop() {
                 stopLoop();
                 timer = setInterval(() => {
-                    if (!enabled) return;
-                    void sendCurrentCommand();
+                    if (enabled) {
+                        void sendCurrentCommand();
+                    }
                 }, SPEEDS.intervalMs);
             }
 
@@ -293,6 +306,47 @@
                 } else {
                     void forceStop();
                 }
+            }
+
+            async function refreshMap() {
+                const stamp = Date.now();
+                mapImage.src = `/api/latest-map.png?t=${stamp}`;
+                try {
+                    const response = await fetch(`/api/latest-map.json?t=${stamp}`);
+                    if (!response.ok) {
+                        return;
+                    }
+                    const data = await response.json();
+                    if (data.pose) {
+                        poseStatus.textContent = `x=${data.pose.x.toFixed(2)} y=${data.pose.y.toFixed(2)} yaw=${data.pose.yaw.toFixed(2)}`;
+                    }
+                    if (data.counts) {
+                        mapCounts.textContent = `free=${data.counts.free} occ=${data.counts.occupied} unk=${data.counts.unknown}`;
+                    }
+                } catch (error) {
+                    console.error("Failed to refresh map metadata", error);
+                }
+            }
+
+            function bindHoldButton(button) {
+                const key = button.dataset.hold;
+                const press = (event) => {
+                    if (!enabled) return;
+                    event.preventDefault();
+                    pressed.add(key);
+                    updateKeyboardUi();
+                    void sendCurrentCommand();
+                };
+                const release = (event) => {
+                    event.preventDefault();
+                    pressed.delete(key);
+                    updateKeyboardUi();
+                    void sendCurrentCommand();
+                };
+                button.addEventListener("pointerdown", press);
+                button.addEventListener("pointerup", release);
+                button.addEventListener("pointerleave", release);
+                button.addEventListener("pointercancel", release);
             }
 
             keyboardToggle.addEventListener("click", () => {
@@ -343,19 +397,16 @@
                 void sendCurrentCommand();
             });
 
-            window.addEventListener("blur", () => {
-                if (enabled) {
-                    void forceStop();
-                }
+            window.addEventListener("beforeunload", () => {
+                void forceStop();
             });
 
-            document.addEventListener("visibilitychange", () => {
-                if (document.hidden && enabled) {
-                    void forceStop();
-                }
-            });
-
+            holdButtons.forEach(bindHoldButton);
             updateKeyboardUi();
+            void refreshMap();
+            setInterval(() => {
+                void refreshMap();
+            }, 750);
         })();
     </script>
 </body>

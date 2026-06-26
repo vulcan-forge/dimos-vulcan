@@ -22,6 +22,7 @@ The frontend is served from a separate HTML file.
 """
 
 import asyncio
+import json
 from pathlib import Path as FilePath
 import threading
 import time
@@ -45,6 +46,7 @@ _COMMAND_CENTER_HTML = _TEMPLATES_DIR / "sourccey_command_center.html"
 _COMMAND_CENTER_DIR = (
     FilePath(__file__).parent.parent / "command-center-extension" / "dist-standalone"
 )
+_DEFAULT_SOURCCEY_MAP_DIR = FilePath(__file__).parent.parent.parent / "assets" / "output" / "sourccey_maps"
 
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.core import rpc
@@ -52,8 +54,6 @@ from dimos.core.global_config import global_config
 from dimos.core.module import Module, ModuleConfig
 from dimos.core.stream import In, Out
 from dimos.mapping.models import LatLon
-from dimos.mapping.occupancy.gradient import gradient
-from dimos.mapping.occupancy.inflation import simple_inflate
 from dimos.msgs.geometry_msgs.PoseStamped import PoseStamped
 from dimos.msgs.geometry_msgs.Twist import Twist
 from dimos.msgs.geometry_msgs.TwistStamped import TwistStamped
@@ -272,12 +272,30 @@ class WebsocketVisModule(Module):
             self.stop_explore_cmd.publish(Bool(data=True))
             return JSONResponse({"ok": True})
 
+        async def api_latest_map(request):  # type: ignore[no-untyped-def]
+            map_png = _DEFAULT_SOURCCEY_MAP_DIR / "latest_map.png"
+            if not map_png.exists():
+                return Response(content="Map image not available yet", status_code=404, media_type="text/plain")
+            return FileResponse(map_png, media_type="image/png")
+
+        async def api_latest_map_metadata(request):  # type: ignore[no-untyped-def]
+            map_json = _DEFAULT_SOURCCEY_MAP_DIR / "latest_map.json"
+            if not map_json.exists():
+                return JSONResponse({"ok": False, "error": "metadata not available"}, status_code=404)
+            try:
+                payload = json.loads(map_json.read_text(encoding="utf-8"))
+            except Exception as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+            return JSONResponse(payload)
+
         routes = [
             Route("/", serve_index),
             Route("/command-center", serve_command_center),
             Route("/api/move", api_move, methods=["POST"]),
             Route("/api/start-explore", api_start_explore, methods=["POST"]),
             Route("/api/stop-explore", api_stop_explore, methods=["POST"]),
+            Route("/api/latest-map.png", api_latest_map),
+            Route("/api/latest-map.json", api_latest_map_metadata),
         ]
 
         starlette_app = Starlette(routes=routes)
@@ -387,7 +405,6 @@ class WebsocketVisModule(Module):
 
     def _process_costmap(self, costmap: OccupancyGrid) -> dict[str, Any]:
         """Convert OccupancyGrid to visualization format."""
-        costmap = gradient(simple_inflate(costmap, 0.1), max_distance=1.0)
         grid_data = self.costmap_encoder.encode_costmap(costmap.grid)
 
         return {
