@@ -35,6 +35,7 @@ def test_build_pointcloud_from_scan_generates_free_and_obstacle_points() -> None
         _pose(0.0, 0.0, 0.0),
         forward_angle_deg=180.0,
         valid_angle_half_width_deg=90.0,
+        invert_lateral_axis=False,
         max_distance_m=8.0,
         min_confidence=0,
         free_ray_step_m=0.25,
@@ -80,6 +81,7 @@ def test_build_pointcloud_from_scan_applies_world_pose() -> None:
         _pose(1.0, 2.0, math.pi / 2.0),
         forward_angle_deg=180.0,
         valid_angle_half_width_deg=90.0,
+        invert_lateral_axis=False,
         max_distance_m=8.0,
         min_confidence=0,
         free_ray_step_m=0.5,
@@ -118,6 +120,7 @@ def test_build_pointcloud_from_scan_filters_back_half_plane() -> None:
         _pose(0.0, 0.0, 0.0),
         forward_angle_deg=180.0,
         valid_angle_half_width_deg=90.0,
+        invert_lateral_axis=False,
         max_distance_m=8.0,
         min_confidence=0,
         free_ray_step_m=0.5,
@@ -134,6 +137,45 @@ def test_build_pointcloud_from_scan_filters_back_half_plane() -> None:
             [
                 [0.5, 0.0, 0.0],
                 [1.0, 0.0, 0.25],
+            ],
+            dtype=np.float32,
+        ),
+        atol=1e-5,
+    )
+
+
+def test_build_pointcloud_from_scan_can_flip_lateral_axis() -> None:
+    scan = PlanarLidarScan(
+        ts=1.0,
+        frame_id="base_lidar",
+        rpm=600.0,
+        angles_deg=[270.0],
+        distances_m=[1.0],
+        confidences=[20],
+    )
+
+    cloud = build_pointcloud_from_scan(
+        scan,
+        _pose(0.0, 0.0, 0.0),
+        forward_angle_deg=180.0,
+        valid_angle_half_width_deg=90.0,
+        invert_lateral_axis=True,
+        max_distance_m=8.0,
+        min_confidence=0,
+        free_ray_step_m=0.5,
+        free_ray_start_m=0.5,
+        free_height_m=0.0,
+        obstacle_height_m=0.25,
+        frame_id="world",
+    )
+
+    points, _ = cloud.as_numpy()
+    np.testing.assert_allclose(
+        points,
+        np.asarray(
+            [
+                [0.0, 0.5, 0.0],
+                [0.0, 1.0, 0.25],
             ],
             dtype=np.float32,
         ),

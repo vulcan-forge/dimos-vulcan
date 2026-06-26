@@ -16,6 +16,7 @@ sourccey_lidar_mapping = autoconnect(
     SourcceyLidarPointCloudAdapter.blueprint(
         forward_angle_deg=180.0,
         valid_angle_half_width_deg=90.0,
+        invert_lateral_axis=True,
         max_distance_m=8.0,
         min_confidence=5,
         free_ray_step_m=0.05,
