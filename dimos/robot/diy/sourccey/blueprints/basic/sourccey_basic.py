@@ -8,6 +8,19 @@ from dimos.robot.diy.sourccey.connection import SourcceyConnection
 from dimos.visualization.vis_module import vis_module
 
 
+def _viewer_downsample(points: np.ndarray, max_points: int) -> np.ndarray:
+    if len(points) <= max_points:
+        return points
+    indices = np.linspace(0, len(points) - 1, max_points, dtype=np.int32)
+    return points[indices]
+
+
+def _viewer_downsample_indices(length: int, max_points: int) -> np.ndarray | None:
+    if length <= max_points:
+        return None
+    return np.linspace(0, length - 1, max_points, dtype=np.int32)
+
+
 def _convert_camera_info(camera_info):  # type: ignore[no-untyped-def]
     return camera_info.to_rerun(
         image_topic="/world/color_image",
@@ -31,8 +44,13 @@ def _global_map_colors(cloud):  # type: ignore[no-untyped-def]
     points = cloud.points_f32()
     if len(points) == 0:
         return rr.Points3D([])
+    downsample_indices = _viewer_downsample_indices(len(points), 14000)
+    if downsample_indices is not None:
+        points = points[downsample_indices]
 
     intensities = cloud.intensities_f32()
+    if intensities is not None and downsample_indices is not None:
+        intensities = intensities[downsample_indices]
     if intensities is not None and len(intensities) == len(points):
         # Free-space samples are emitted with intensity 0, obstacle endpoints with sensor confidence.
         obstacle_mask = intensities > 0.0
@@ -57,6 +75,7 @@ def _registered_scan_colors(cloud):  # type: ignore[no-untyped-def]
     points = cloud.points_f32()
     if len(points) == 0:
         return rr.Points3D([])
+    points = _viewer_downsample(points, 2500)
     colors = np.full((len(points), 3), [255, 240, 180], dtype=np.uint8)
     return rr.Points3D(positions=points[:, :3], colors=colors, radii=0.055)
 
@@ -99,17 +118,18 @@ rerun_config = {
     "blueprint": _sourccey_rerun_blueprint,
     "visual_override": {
         "world/camera_info": _convert_camera_info,
+        "world/companion_image": None,
+        "world/bottom_image": None,
+        "world/local_map": None,
         "world/global_map": _global_map_colors,
         "world/registered_scan": _registered_scan_colors,
         "world/global_costmap": _global_costmap_mesh,
     },
     "max_hz": {
-        "world/color_image": 0,
-        "world/companion_image": 0,
-        "world/bottom_image": 0,
-        "world/global_map": 12,
-        "world/registered_scan": 12,
-        "world/global_costmap": 8,
+        "world/color_image": 4,
+        "world/global_map": 6,
+        "world/registered_scan": 8,
+        "world/global_costmap": 3,
     },
     "static": {
         "world/tf/base_link": _static_base_link,
