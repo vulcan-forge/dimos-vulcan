@@ -46,7 +46,7 @@ _COMMAND_CENTER_HTML = _TEMPLATES_DIR / "sourccey_command_center.html"
 _COMMAND_CENTER_DIR = (
     FilePath(__file__).parent.parent / "command-center-extension" / "dist-standalone"
 )
-_DEFAULT_SOURCCEY_MAP_DIR = FilePath(__file__).parent.parent.parent / "assets" / "output" / "sourccey_maps"
+_DEFAULT_SOURCCEY_MAP_DIR = FilePath(__file__).parent.parent.parent.parent / "assets" / "output" / "sourccey_maps"
 
 from dimos.constants import DEFAULT_THREAD_JOIN_TIMEOUT
 from dimos.core.core import rpc
