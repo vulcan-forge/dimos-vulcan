@@ -138,7 +138,8 @@
         <div class="card">
             <h1>Sourccey Command Center</h1>
             <div class="sub">
-                Click <strong>Start Keyboard Control</strong>, then use <strong>W/A/S/D</strong> or the arrow keys.
+                Click <strong>Start Keyboard Control</strong>, then use <strong>W/S</strong> for forward and back,
+                <strong>A/D</strong> for strafe, and <strong>Z/X</strong> for rotate.
                 This page sends direct motion commands into the same Dimos teleop stream the mapper uses.
             </div>
             <div class="row">
@@ -158,12 +159,12 @@
                 </div>
             </div>
             <div class="keys">
-                <div class="key" data-key="arrowleft">A / Left</div>
-                <div class="key" data-key="arrowup">W / Up</div>
-                <div class="key" data-key="arrowright">D / Right</div>
-                <div class="key"></div>
-                <div class="key" data-key="arrowdown">S / Down</div>
-                <div class="key"></div>
+                <div class="key" data-key="a">A Strafe</div>
+                <div class="key" data-key="w">W Forward</div>
+                <div class="key" data-key="d">D Strafe</div>
+                <div class="key" data-key="z">Z Rotate</div>
+                <div class="key" data-key="s">S Back</div>
+                <div class="key" data-key="x">X Rotate</div>
             </div>
         </div>
         <div class="footer">
@@ -189,8 +190,8 @@
             );
 
             const SPEEDS = {
-                linear: 0.45,
-                angular: 0.85,
+                linear: 0.9,
+                angular: 0.9,
                 intervalMs: 90,
             };
 
@@ -210,10 +211,6 @@
             }
 
             function aliasKeysForDisplay(key) {
-                if (key === "arrowup") return ["arrowup", "w"];
-                if (key === "arrowdown") return ["arrowdown", "s"];
-                if (key === "arrowleft") return ["arrowleft", "a"];
-                if (key === "arrowright") return ["arrowright", "d"];
                 return [key];
             }
 
@@ -230,15 +227,18 @@
 
             function currentCommand() {
                 let linearX = 0.0;
+                let linearY = 0.0;
                 let angularZ = 0.0;
 
                 if (pressed.has("w") || pressed.has("arrowup")) linearX += SPEEDS.linear;
                 if (pressed.has("s") || pressed.has("arrowdown")) linearX -= SPEEDS.linear;
-                if (pressed.has("a") || pressed.has("arrowleft")) angularZ += SPEEDS.angular;
-                if (pressed.has("d") || pressed.has("arrowright")) angularZ -= SPEEDS.angular;
+                if (pressed.has("a")) linearY += SPEEDS.linear;
+                if (pressed.has("d")) linearY -= SPEEDS.linear;
+                if (pressed.has("z") || pressed.has("arrowleft")) angularZ += SPEEDS.angular;
+                if (pressed.has("x") || pressed.has("arrowright")) angularZ -= SPEEDS.angular;
 
                 return {
-                    linear: { x: linearX, y: 0.0, z: 0.0 },
+                    linear: { x: linearX, y: linearY, z: 0.0 },
                     angular: { x: 0.0, y: 0.0, z: angularZ },
                 };
             }
@@ -325,7 +325,7 @@
             window.addEventListener("keydown", (event) => {
                 if (!enabled) return;
                 const key = event.key.toLowerCase();
-                if (!["w", "a", "s", "d", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(key)) {
+                if (!["w", "a", "s", "d", "z", "x", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(key)) {
                     return;
                 }
                 event.preventDefault();
