@@ -80,6 +80,31 @@ def _registered_scan_colors(cloud):  # type: ignore[no-untyped-def]
     return rr.Points3D(positions=points[:, :3], colors=colors, radii=0.055)
 
 
+def _local_map_colors(cloud):  # type: ignore[no-untyped-def]
+    import rerun as rr
+
+    points = cloud.points_f32()
+    if len(points) == 0:
+        return rr.Points3D([])
+    downsample_indices = _viewer_downsample_indices(len(points), 8000)
+    if downsample_indices is not None:
+        points = points[downsample_indices]
+
+    intensities = cloud.intensities_f32()
+    if intensities is not None and downsample_indices is not None:
+        intensities = intensities[downsample_indices]
+    if intensities is not None and len(intensities) == len(points):
+        obstacle_mask = intensities > 0.0
+        colors = np.zeros((len(points), 3), dtype=np.uint8)
+        colors[~obstacle_mask] = np.array([70, 150, 255], dtype=np.uint8)
+        colors[obstacle_mask] = np.array([255, 235, 120], dtype=np.uint8)
+        radii = np.where(obstacle_mask, 0.05, 0.03).astype(np.float32)
+        return rr.Points3D(positions=points[:, :3], colors=colors, radii=radii)
+
+    colors = np.full((len(points), 3), [100, 180, 255], dtype=np.uint8)
+    return rr.Points3D(positions=points[:, :3], colors=colors, radii=0.035)
+
+
 def _global_costmap_mesh(grid):  # type: ignore[no-untyped-def]
     return grid.to_rerun(
         background="#0d0f14",
@@ -89,25 +114,13 @@ def _global_costmap_mesh(grid):  # type: ignore[no-untyped-def]
 
 
 def _sourccey_rerun_blueprint():  # type: ignore[no-untyped-def]
-    import rerun as rr
     import rerun.blueprint as rrb
 
     return rrb.Blueprint(
-        rrb.Horizontal(
-            rrb.Vertical(
-                rrb.Spatial2DView(origin="world/color_image", name="Primary"),
-                rrb.Spatial2DView(origin="world/companion_image", name="Companion"),
-                rrb.Spatial2DView(origin="world/bottom_image", name="Bottom"),
-            ),
-            rrb.Spatial3DView(
-                origin="world",
-                name="3D",
-                background=rrb.Background(kind="SolidColor", color=[0, 0, 0]),
-                line_grid=rrb.LineGrid3D(
-                    plane=rr.components.Plane3D.XY.with_distance(0.0),
-                ),
-            ),
-            column_shares=[1, 2],
+        rrb.Spatial3DView(
+            origin="world",
+            name="3D",
+            background=rrb.Background(kind="SolidColor", color=[0, 0, 0]),
         ),
         rrb.TimePanel(state="hidden"),
         rrb.SelectionPanel(state="hidden"),
@@ -118,18 +131,18 @@ rerun_config = {
     "blueprint": _sourccey_rerun_blueprint,
     "visual_override": {
         "world/camera_info": _convert_camera_info,
+        "world/color_image": None,
         "world/companion_image": None,
         "world/bottom_image": None,
-        "world/local_map": None,
-        "world/global_map": _global_map_colors,
+        "world/local_map": _local_map_colors,
+        "world/global_map": None,
         "world/registered_scan": _registered_scan_colors,
         "world/global_costmap": _global_costmap_mesh,
     },
     "max_hz": {
-        "world/color_image": 4,
-        "world/global_map": 6,
-        "world/registered_scan": 8,
-        "world/global_costmap": 3,
+        "world/local_map": 12,
+        "world/registered_scan": 12,
+        "world/global_costmap": 8,
     },
     "static": {
         "world/tf/base_link": _static_base_link,
