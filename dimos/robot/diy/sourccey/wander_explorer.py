@@ -568,12 +568,17 @@ class SourcceyWanderExplorer(Module):
         self._dbg_last_wall_ts: dict[str, float] = {}
 
     def _dbg(self, tag: str, **fields: Any) -> None:
-        """Log ``[wander.<tag>]`` at most once per ``_DBG_MIN_INTERVAL_S`` per tag."""
-        now = time.time()
-        if (now - self._dbg_last_wall_ts.get(tag, 0.0)) < _DBG_MIN_INTERVAL_S:
-            return
-        self._dbg_last_wall_ts[tag] = now
-        logger.info(f"[wander.{tag}]", **fields)
+        """Rate-limited ``[wander.<tag>]`` debug logging.
+
+        Disabled: this was the diagnostic spam used to debug the movement/mapping
+        issues. Uncomment the body below to re-enable per-tag debug logs.
+        """
+        return
+        # now = time.time()
+        # if (now - self._dbg_last_wall_ts.get(tag, 0.0)) < _DBG_MIN_INTERVAL_S:
+        #     return
+        # self._dbg_last_wall_ts[tag] = now
+        # logger.info(f"[wander.{tag}]", **fields)
 
     @rpc
     def start(self) -> None:

@@ -60,12 +60,18 @@ class SourcceyLidarSafetyGate(Module):
         self._dbg_last_wall_ts: dict[str, float] = {}
 
     def _dbg(self, tag: str, **fields: Any) -> None:
-        """Log ``[safety_gate.<tag>]`` at most once per ``_DBG_MIN_INTERVAL_S`` per tag."""
-        now = time.time()
-        if (now - self._dbg_last_wall_ts.get(tag, 0.0)) < _DBG_MIN_INTERVAL_S:
-            return
-        self._dbg_last_wall_ts[tag] = now
-        logger.info(f"[safety_gate.{tag}]", **fields)
+        """Rate-limited ``[safety_gate.<tag>]`` debug logging.
+
+        Disabled: diagnostic spam from debugging the safety-gate behavior.
+        Uncomment the body below to re-enable per-tag debug logs. The explicit
+        "currently safety blocked" warning in ``_on_cmd_vel`` stays active.
+        """
+        return
+        # now = time.time()
+        # if (now - self._dbg_last_wall_ts.get(tag, 0.0)) < _DBG_MIN_INTERVAL_S:
+        #     return
+        # self._dbg_last_wall_ts[tag] = now
+        # logger.info(f"[safety_gate.{tag}]", **fields)
 
     @rpc
     def start(self) -> None:
