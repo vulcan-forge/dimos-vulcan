@@ -399,6 +399,12 @@ class SourcceyConnectionConfig(ModuleConfig):
     max_linear_speed_m_s: float = 1.0
     max_strafe_speed_m_s: float = 1.0
     max_angular_speed_rad_s: float = 1.2
+    # The base reports x_vel/y_vel/theta_vel as normalized wheel throttles in
+    # [-1, 1], NOT m/s / rad/s. Dead-reckoning must scale these to real units or
+    # the virtual robot races ~2x ahead of the physical one (smeared map). These
+    # are coarse calibration constants: full throttle ~= 0.5 m/s of real travel.
+    odom_linear_scale_m_per_unit: float = 0.5
+    odom_angular_scale_rad_per_unit: float = 1.0
     allow_unsafe_base_control_without_state: bool = False
     primary_camera_key: str = "front_left"
     companion_camera_key: str = "front_right"
@@ -836,7 +842,9 @@ class SourcceyConnection(Module, Camera, IMU):
             )
             return
 
-        theta_rate = float(self._signed_yaw(float(state.theta_vel)) or 0.0)
+        ang_scale = float(self.config.odom_angular_scale_rad_per_unit)
+        lin_scale = float(self.config.odom_linear_scale_m_per_unit)
+        theta_rate = float(self._signed_yaw(float(state.theta_vel)) or 0.0) * ang_scale
         self._yaw_rad += theta_rate * dt
         self._apply_absolute_heading_corrections(wall_ts=wall_ts)
 
@@ -848,8 +856,9 @@ class SourcceyConnection(Module, Camera, IMU):
         if slam_is_fresh:
             self._dead_reckon_xy = np.asarray(self._last_slam_position_xy, dtype=np.float64)
         else:
-            vx = float(state.x_vel)
-            vy = float(state.y_vel)
+            # x_vel/y_vel are normalized throttles -> scale to m/s before integrating.
+            vx = float(state.x_vel) * lin_scale
+            vy = float(state.y_vel) * lin_scale
             cos_yaw = math.cos(self._yaw_rad)
             sin_yaw = math.sin(self._yaw_rad)
             dx = (vx * cos_yaw) - (vy * sin_yaw)
@@ -975,11 +984,18 @@ class SourcceyConnection(Module, Camera, IMU):
             dt = max(0.0, min(wall_ts - self._last_packet_wall_ts, 0.5))
         self._last_packet_wall_ts = wall_ts
 
+        ang_scale = float(self.config.odom_angular_scale_rad_per_unit)
+        lin_scale = float(self.config.odom_linear_scale_m_per_unit)
         theta_rate = 0.0
         if packet.imu_samples:
+            # gz is a real gyro rate (rad/s) — do not apply the throttle scale.
             theta_rate = float(self._signed_yaw(float(packet.imu_samples[-1].gz)) or 0.0)
         elif packet.base_velocity:
-            theta_rate = float(self._signed_yaw(float(packet.base_velocity.get("theta.vel", 0.0))) or 0.0)
+            # theta.vel is a normalized throttle — scale to rad/s.
+            theta_rate = (
+                float(self._signed_yaw(float(packet.base_velocity.get("theta.vel", 0.0))) or 0.0)
+                * ang_scale
+            )
         self._yaw_rad += theta_rate * dt
         self._apply_absolute_heading_corrections(
             wall_ts=wall_ts,
@@ -998,8 +1014,9 @@ class SourcceyConnection(Module, Camera, IMU):
         if slam_is_fresh:
             self._dead_reckon_xy = np.asarray(self._last_slam_position_xy, dtype=np.float64)
         else:
-            vx = float(packet.base_velocity.get("x.vel", 0.0))
-            vy = float(packet.base_velocity.get("y.vel", 0.0))
+            # x.vel/y.vel are normalized throttles -> scale to m/s before integrating.
+            vx = float(packet.base_velocity.get("x.vel", 0.0)) * lin_scale
+            vy = float(packet.base_velocity.get("y.vel", 0.0)) * lin_scale
             cos_yaw = math.cos(self._yaw_rad)
             sin_yaw = math.sin(self._yaw_rad)
             dx = (vx * cos_yaw) - (vy * sin_yaw)

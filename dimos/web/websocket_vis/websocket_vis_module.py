@@ -419,7 +419,7 @@ class WebsocketVisModule(Module):
             asyncio.run_coroutine_threadsafe(self.sio.emit(event, data), self._broadcast_loop)
 
     def _publish_move_command(self, sid: str, data: dict[str, Any]) -> None:
-        logger.info("Received web move_command", sid=sid, data=data)
+        logger.debug("Received web move_command", sid=sid, data=data)
 
         linear = data.get("linear", {})
         angular = data.get("angular", {})
@@ -436,8 +436,24 @@ class WebsocketVisModule(Module):
             ),
         )
 
+        # The web joystick streams neutral (all-zero) commands continuously when
+        # idle. On the autonomous explore stack the web tele_cmd_vel shares the
+        # safety-gate input with the explorer, so a steady stream of zeros would
+        # constantly veto the explorer's drive commands. Send the first zero (to
+        # honor a real "stop"/joystick release) but suppress the repeats so an
+        # untouched joystick doesn't fight the autonomous controller.
+        is_zero = (
+            abs(float(twist.linear.x)) < 1e-6
+            and abs(float(twist.linear.y)) < 1e-6
+            and abs(float(twist.angular.z)) < 1e-6
+        )
+        last_was_zero = getattr(self, "_last_tele_was_zero", False)
+        if is_zero and last_was_zero:
+            return
+        self._last_tele_was_zero = is_zero
+
         if self.tele_cmd_vel and self.tele_cmd_vel.transport:
-            logger.info(
+            logger.debug(
                 "Publishing tele_cmd_vel",
                 linear_x=round(float(twist.linear.x), 4),
                 linear_y=round(float(twist.linear.y), 4),

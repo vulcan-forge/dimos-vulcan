@@ -30,6 +30,10 @@ class SourcceyLidarPointCloudAdapterConfig(ModuleConfig):
     lidar_mount_x_m: float = 0.0
     lidar_mount_y_m: float = 0.0
     max_distance_m: float = 8.0
+    # Drop returns closer than this: they are the robot's own body / arms / lidar
+    # housing, not real obstacles, and otherwise paint a permanent ring of phantom
+    # green "remembered" points right around the robot.
+    min_range_m: float = 0.22
     min_confidence: int = 0
     free_ray_step_m: float = 0.05
     free_ray_start_m: float = 0.05
@@ -67,6 +71,7 @@ def _scan_to_local_points(
     invert_lateral_axis: bool,
     max_distance_m: float,
     min_confidence: int,
+    min_range_m: float = 0.0,
 ) -> list[tuple[float, float, float, int]]:
     points: list[tuple[float, float, float, int]] = []
     for angle_deg, distance_m, confidence in zip(
@@ -80,6 +85,8 @@ def _scan_to_local_points(
         if conf < int(min_confidence):
             continue
         if not math.isfinite(distance) or distance <= 0.0 or distance > float(max_distance_m):
+            continue
+        if distance < float(min_range_m):
             continue
         delta_deg = normalize_angle_deg(float(angle_deg) - float(forward_angle_deg))
         if abs(delta_deg) > float(valid_angle_half_width_deg):
@@ -208,6 +215,7 @@ def build_pointcloud_from_scan(
     free_height_m: float,
     obstacle_height_m: float,
     frame_id: str,
+    min_range_m: float = 0.0,
 ) -> PointCloud2:
     local_points = _scan_to_local_points(
         scan,
@@ -216,6 +224,7 @@ def build_pointcloud_from_scan(
         invert_lateral_axis=invert_lateral_axis,
         max_distance_m=max_distance_m,
         min_confidence=min_confidence,
+        min_range_m=min_range_m,
     )
     if not local_points:
         return PointCloud2.from_numpy(
@@ -658,6 +667,7 @@ class SourcceyLidarPointCloudAdapter(Module):
             invert_lateral_axis=bool(self.config.invert_lateral_axis),
             max_distance_m=float(self.config.max_distance_m),
             min_confidence=int(self.config.min_confidence),
+            min_range_m=float(self.config.min_range_m),
         )
         local_points_xy = (
             np.asarray([(forward_m, lateral_m) for forward_m, lateral_m, _, _ in local_points], dtype=np.float32)
@@ -695,6 +705,7 @@ class SourcceyLidarPointCloudAdapter(Module):
             free_height_m=float(self.config.free_height_m),
             obstacle_height_m=float(self.config.obstacle_height_m),
             frame_id=self.config.frame_id,
+            min_range_m=float(self.config.min_range_m),
         )
         if len(cloud) == 0 and not bool(self.config.publish_empty_clouds):
             return
