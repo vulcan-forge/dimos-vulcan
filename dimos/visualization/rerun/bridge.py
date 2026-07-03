@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import field
+import os
 import signal
 import socket
 import subprocess
@@ -318,8 +319,10 @@ class RerunBridgeModule(Module):
         connect_url = self.config.connect_url
         if connect_url is None:
             connect_url = f"rerun+http://{self.host}:{RERUN_GRPC_PORT}/proxy"
+        recording_id = f"dimos-{os.getpid()}-{time.time_ns()}"
 
         server_uri = rerun_init(
+            recording_id=recording_id,
             start_grpc=True,
             grpc_config={
                 "connect_url": connect_url,
@@ -327,6 +330,7 @@ class RerunBridgeModule(Module):
             },
         )
         assert server_uri is not None  # start_grpc=True guarantees a URI
+        logger.info("Rerun bridge using fresh recording_id=%s", recording_id)
 
         parsed = urlparse(connect_url.replace("rerun+", "", 1))
         grpc_port = parsed.port or RERUN_GRPC_PORT

@@ -44,12 +44,12 @@ class PlanarLidarScan:
 
 @dataclass(slots=True)
 class StopZoneConfig:
-    forward_angle_deg: float = 180.0
-    min_distance_m: float = 0.12
-    tripwire_distance_m: float = 0.105
-    tripwire_half_width_m: float = 0.525
+    forward_angle_deg: float = 270.0
+    min_distance_m: float = 0.03
+    tripwire_distance_m: float = 0.14
+    tripwire_half_width_m: float = 0.28
     tripwire_thickness_m: float = 0.12
-    min_points_to_trigger: int = 6
+    min_points_to_trigger: int = 8
     min_confidence: int = 0
 
 
@@ -60,4 +60,3 @@ class StopZoneState:
     blocking_points: int
     threshold_points: int
     nearest_blocking_distance_m: float | None
-

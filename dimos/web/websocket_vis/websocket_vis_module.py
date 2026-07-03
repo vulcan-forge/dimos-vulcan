@@ -29,7 +29,7 @@ import time
 from typing import Any
 import webbrowser
 
-from dimos_lcm.std_msgs import Bool
+from dimos_lcm.std_msgs import Bool as LcmBool
 from reactivex.disposable import Disposable
 import socketio  # type: ignore[import-untyped]
 from starlette.applications import Starlette
@@ -60,6 +60,7 @@ from dimos.msgs.geometry_msgs.TwistStamped import TwistStamped
 from dimos.msgs.geometry_msgs.Vector3 import Vector3
 from dimos.msgs.nav_msgs.OccupancyGrid import OccupancyGrid
 from dimos.msgs.nav_msgs.Path import Path
+from dimos.msgs.std_msgs.Bool import Bool as MsgBool
 from dimos.utils.logging_config import setup_logger
 
 from .optimized_costmap import OptimizedCostmapEncoder
@@ -104,8 +105,10 @@ class WebsocketVisModule(Module):
     # LCM outputs
     goal_request: Out[PoseStamped]
     gps_goal: Out[LatLon]
-    explore_cmd: Out[Bool]
-    stop_explore_cmd: Out[Bool]
+    explore_cmd: Out[LcmBool]
+    stop_explore_cmd: Out[LcmBool]
+    snapshot_request: Out[MsgBool]
+    reset_request: Out[MsgBool]
     tele_cmd_vel: Out[Twist]
     movecmd_stamped: Out[TwistStamped]
 
@@ -133,6 +136,22 @@ class WebsocketVisModule(Module):
         logger.info(
             f"WebSocket visualization module initialized on port {self.config.port}, GPS goal tracking enabled"
         )
+
+    def _publish_msg_bool_command(self, port_name: str, port: Out[MsgBool], value: bool = True) -> bool:
+        if port is None or port.transport is None:
+            logger.warning("%s transport is unavailable for web command", port_name)
+            return False
+        port.publish(MsgBool(data=bool(value)))
+        logger.info("Published web %s value=%s", port_name, bool(value))
+        return True
+
+    def _publish_lcm_bool_command(self, port_name: str, port: Out[LcmBool], value: bool = True) -> bool:
+        if port is None or port.transport is None:
+            logger.warning("%s transport is unavailable for web command", port_name)
+            return False
+        port.publish(LcmBool(data=bool(value)))
+        logger.info("Published web %s value=%s", port_name, bool(value))
+        return True
 
     def _start_broadcast_loop(self) -> None:
         def websocket_vis_loop() -> None:
@@ -260,13 +279,27 @@ class WebsocketVisModule(Module):
 
         async def api_start_explore(request):  # type: ignore[no-untyped-def]
             logger.info("Starting exploration via HTTP command-center")
-            self.explore_cmd.publish(Bool(data=True))
-            return JSONResponse({"ok": True})
+            ok = self._publish_lcm_bool_command("explore_cmd", self.explore_cmd, True)
+            status = 200 if ok else 409
+            return JSONResponse({"ok": ok}, status_code=status)
 
         async def api_stop_explore(request):  # type: ignore[no-untyped-def]
             logger.info("Stopping exploration via HTTP command-center")
-            self.stop_explore_cmd.publish(Bool(data=True))
-            return JSONResponse({"ok": True})
+            ok = self._publish_lcm_bool_command("stop_explore_cmd", self.stop_explore_cmd, True)
+            status = 200 if ok else 409
+            return JSONResponse({"ok": ok}, status_code=status)
+
+        async def api_manual_snapshot(request):  # type: ignore[no-untyped-def]
+            logger.info("Manual snapshot requested via HTTP command-center")
+            ok = self._publish_msg_bool_command("snapshot_request", self.snapshot_request, True)
+            status = 200 if ok else 409
+            return JSONResponse({"ok": ok, "action": "snapshot"}, status_code=status)
+
+        async def api_manual_reset(request):  # type: ignore[no-untyped-def]
+            logger.info("Manual snapshot map reset requested via HTTP command-center")
+            ok = self._publish_msg_bool_command("reset_request", self.reset_request, True)
+            status = 200 if ok else 409
+            return JSONResponse({"ok": ok, "action": "reset"}, status_code=status)
 
         async def api_latest_map(request):  # type: ignore[no-untyped-def]
             map_png = _DEFAULT_SOURCCEY_MAP_DIR / "latest_map.png"
@@ -290,6 +323,8 @@ class WebsocketVisModule(Module):
             Route("/api/move", api_move, methods=["POST"]),
             Route("/api/start-explore", api_start_explore, methods=["POST"]),
             Route("/api/stop-explore", api_stop_explore, methods=["POST"]),
+            Route("/api/manual-snapshot", api_manual_snapshot, methods=["POST"]),
+            Route("/api/manual-reset", api_manual_reset, methods=["POST"]),
             Route("/api/latest-map.png", api_latest_map),
             Route("/api/latest-map.json", api_latest_map_metadata),
         ]
@@ -349,12 +384,22 @@ class WebsocketVisModule(Module):
         @self.sio.event  # type: ignore[untyped-decorator]
         async def start_explore(sid: str) -> None:
             logger.info("Starting exploration")
-            self.explore_cmd.publish(Bool(data=True))
+            self._publish_lcm_bool_command("explore_cmd", self.explore_cmd, True)
 
         @self.sio.event  # type: ignore[untyped-decorator]
         async def stop_explore(sid) -> None:  # type: ignore[no-untyped-def]
             logger.info("Stopping exploration")
-            self.stop_explore_cmd.publish(Bool(data=True))
+            self._publish_lcm_bool_command("stop_explore_cmd", self.stop_explore_cmd, True)
+
+        @self.sio.event  # type: ignore[untyped-decorator]
+        async def manual_snapshot(sid: str) -> None:
+            logger.info("Manual snapshot requested via websocket sid=%s", sid)
+            self._publish_msg_bool_command("snapshot_request", self.snapshot_request, True)
+
+        @self.sio.event  # type: ignore[untyped-decorator]
+        async def manual_reset(sid: str) -> None:
+            logger.info("Manual snapshot reset requested via websocket sid=%s", sid)
+            self._publish_msg_bool_command("reset_request", self.reset_request, True)
 
         @self.sio.event  # type: ignore[untyped-decorator]
         async def clear_gps_goals(sid: str) -> None:

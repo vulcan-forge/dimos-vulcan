@@ -32,6 +32,7 @@ from dimos.spec.perception import Camera, IMU
 from dimos.utils.logging_config import setup_logger
 
 from .protobuf.generated import sourccey_pb2
+from .run_trace import trace_event
 
 logger = setup_logger()
 
@@ -425,6 +426,12 @@ class SourcceyConnectionConfig(ModuleConfig):
     slam_heading_max_step_deg: float = 20.0
     invert_yaw_sign: bool = True
     localized_pose_fresh_window_s: float = 0.6
+    # Use the localized mapper pose for TF only once the base is effectively
+    # stationary. While the base is moving, prefer live dead-reckoned odom so
+    # the robot marker and explorer heading keep tracking real motion instead of
+    # freezing on the last accepted stationary mapping commit.
+    localized_pose_stationary_linear_thresh: float = 0.08
+    localized_pose_stationary_angular_thresh: float = 0.08
     # Approximate multi-camera rig geometry for Sourccey.
     # These defaults are intentionally non-zero because the front cameras are not parallel,
     # and the bottom camera is pitched downward relative to the base.
@@ -477,6 +484,7 @@ class SourcceyConnection(Module, Camera, IMU):
         self._packets_without_imu = 0
         self._logged_imu_present = False
         self._latest_localized_pose: PoseStamped | None = None
+        self._last_tf_pose_source: str | None = None
 
     def _signed_yaw(self, value: float | None) -> float | None:
         if value is None:
@@ -513,6 +521,15 @@ class SourcceyConnection(Module, Camera, IMU):
             observation_endpoint=self.config.observation_endpoint,
             mosaic=self.config.publish_mosaic_as_color_image,
         )
+        trace_event(
+            "connection",
+            "start",
+            input_endpoint=self.config.slam_input_endpoint,
+            output_endpoint=self.config.slam_output_endpoint,
+            command_endpoint=self.config.command_endpoint,
+            observation_endpoint=self.config.observation_endpoint,
+            mosaic=bool(self.config.publish_mosaic_as_color_image),
+        )
 
     @rpc
     def stop(self) -> None:
@@ -545,10 +562,74 @@ class SourcceyConnection(Module, Camera, IMU):
             linear_y=round(float(msg.linear.y), 4),
             angular_z=round(float(msg.angular.z), 4),
         )
-        self.move(msg)
+        trace_event(
+            "connection",
+            "cmd_vel_received",
+            linear_x=round(float(msg.linear.x), 4),
+            linear_y=round(float(msg.linear.y), 4),
+            angular_z=round(float(msg.angular.z), 4),
+        )
+        accepted = self.move(msg)
+        logger.info(
+            "SourcceyConnection move result",
+            accepted=bool(accepted),
+            linear_x=round(float(msg.linear.x), 4),
+            linear_y=round(float(msg.linear.y), 4),
+            angular_z=round(float(msg.angular.z), 4),
+        )
+        trace_event(
+            "connection",
+            "move_result",
+            accepted=bool(accepted),
+            linear_x=round(float(msg.linear.x), 4),
+            linear_y=round(float(msg.linear.y), 4),
+            angular_z=round(float(msg.angular.z), 4),
+        )
 
     def _on_localized_pose(self, msg: PoseStamped) -> None:
         self._latest_localized_pose = msg
+
+    def _base_is_effectively_stationary(self) -> bool:
+        state = self._get_robot_state()
+        if state is None:
+            return True
+        linear_mag = math.hypot(float(state.x_vel), float(state.y_vel))
+        angular_mag = abs(float(state.theta_vel))
+        return (
+            linear_mag <= float(self.config.localized_pose_stationary_linear_thresh)
+            and angular_mag <= float(self.config.localized_pose_stationary_angular_thresh)
+        )
+
+    def _trace_tf_pose_source(
+        self,
+        *,
+        source: str,
+        linear_mag: float,
+        angular_mag: float,
+        localized_age_s: float | None,
+    ) -> None:
+        if source == self._last_tf_pose_source:
+            return
+        self._last_tf_pose_source = source
+        logger.info(
+            "SourcceyConnection TF pose source switched",
+            source=source,
+            linear_mag=round(linear_mag, 4),
+            angular_mag=round(angular_mag, 4),
+            localized_age_s=(
+                None if localized_age_s is None else round(float(localized_age_s), 3)
+            ),
+        )
+        trace_event(
+            "connection",
+            "tf_pose_source",
+            source=source,
+            linear_mag=round(linear_mag, 4),
+            angular_mag=round(angular_mag, 4),
+            localized_age_s=(
+                None if localized_age_s is None else round(float(localized_age_s), 3)
+            ),
+        )
 
 
     @rpc
@@ -577,7 +658,19 @@ class SourcceyConnection(Module, Camera, IMU):
 
         state = self._get_robot_state()
         if state is None and not self.config.allow_unsafe_base_control_without_state:
-            logger.warning("Ignoring Sourccey cmd_vel until a real robot state packet has been received")
+            logger.warning(
+                "Ignoring Sourccey cmd_vel until a real robot state packet has been received",
+                requested_linear_x=round(float(vx), 4),
+                requested_linear_y=round(float(vy), 4),
+                requested_theta_vel=round(float(wz), 4),
+            )
+            trace_event(
+                "connection",
+                "cmd_vel_rejected_no_state",
+                requested_linear_x=round(float(vx), 4),
+                requested_linear_y=round(float(vy), 4),
+                requested_theta_vel=round(float(wz), 4),
+            )
             return False
         if state is None:
             state = _RobotObservationState.zero()
@@ -596,7 +689,28 @@ class SourcceyConnection(Module, Camera, IMU):
             y_vel=round(vy, 4),
             theta_vel=round(wz, 4),
         )
+        trace_event(
+            "connection",
+            "send_base_command",
+            x_vel=round(vx, 4),
+            y_vel=round(vy, 4),
+            theta_vel=round(wz, 4),
+            duration=round(float(duration), 4),
+        )
         if not self._send_command_payload(payload):
+            logger.warning(
+                "Failed to send Sourccey base command payload",
+                x_vel=round(vx, 4),
+                y_vel=round(vy, 4),
+                theta_vel=round(wz),  # intentional integer-ish field in logs
+            )
+            trace_event(
+                "connection",
+                "send_base_command_failed",
+                x_vel=round(vx, 4),
+                y_vel=round(vy, 4),
+                theta_vel=round(wz, 4),
+            )
             return False
 
         self._cancel_cmd_stop_timer()
@@ -689,9 +803,15 @@ class SourcceyConnection(Module, Camera, IMU):
             self._set_robot_state(state)
             self._publish_joint_state(state)
             logger.info("SourcceyConnection received initial robot state")
+            trace_event("connection", "initial_robot_state_received")
             return
         logger.warning(
             "SourcceyConnection did not receive an initial robot state before timeout; cmd_vel will stay guarded until one arrives"
+        )
+        trace_event(
+            "connection",
+            "initial_robot_state_timeout",
+            timeout_s=round(float(timeout_s), 3),
         )
 
     def _drain_input_socket(self) -> None:
@@ -832,14 +952,17 @@ class SourcceyConnection(Module, Camera, IMU):
             and (wall_ts - self._last_packet_wall_ts) <= float(self.config.packet_pose_fresh_window_s)
         )
         if packet_pose_is_fresh:
-            self.odom.publish(
-                PoseStamped(
-                    ts=wall_ts,
-                    frame_id="world",
-                    position=[float(self._dead_reckon_xy[0]), float(self._dead_reckon_xy[1]), 0.0],
-                    orientation=Quaternion.from_euler(Vector3(0.0, 0.0, self._yaw_rad)),
-                )
+            pose = PoseStamped(
+                ts=wall_ts,
+                frame_id="world",
+                position=[float(self._dead_reckon_xy[0]), float(self._dead_reckon_xy[1]), 0.0],
+                orientation=Quaternion.from_euler(Vector3(0.0, 0.0, self._yaw_rad)),
             )
+            # Rerun anchors the cyan robot box to TF, not the raw odom topic.
+            # If the packet stream briefly pauses while observations continue,
+            # publishing odom without TF leaves the box frozen even though the
+            # robot is still physically turning. Keep TF in lock-step here too.
+            self._publish_pose_and_tf(pose)
             return
 
         ang_scale = float(self.config.odom_angular_scale_rad_per_unit)
@@ -871,7 +994,7 @@ class SourcceyConnection(Module, Camera, IMU):
             position=[float(self._dead_reckon_xy[0]), float(self._dead_reckon_xy[1]), 0.0],
             orientation=Quaternion.from_euler(Vector3(0.0, 0.0, self._yaw_rad)),
         )
-        self.odom.publish(pose)
+        self._publish_pose_and_tf(pose)
 
     def _publish_packet(self, packet: _SlamInputPacket) -> None:
         if packet.imu_samples:
@@ -1035,11 +1158,31 @@ class SourcceyConnection(Module, Camera, IMU):
         self.odom.publish(pose)
 
         tf_pose = pose
+        tf_source = "odom_live"
         localized_pose = self._latest_localized_pose
+        state = self._get_robot_state()
+        linear_mag = 0.0
+        angular_mag = 0.0
+        if state is not None:
+            linear_mag = math.hypot(float(state.x_vel), float(state.y_vel))
+            angular_mag = abs(float(state.theta_vel))
+        localized_age_s: float | None = None
         if localized_pose is not None:
             age_s = abs(float(pose.ts) - float(localized_pose.ts))
-            if age_s <= float(self.config.localized_pose_fresh_window_s):
-                tf_pose = localized_pose
+            localized_age_s = age_s
+            # For mapping/debugging we want the viewer pose to reflect the last
+            # trusted LiDAR-localized estimate, not drift away on IMU/odom-only
+            # dead reckoning between snapshots. Keep TF anchored to LiDAR as soon
+            # as a localized pose exists.
+            tf_pose = localized_pose
+            tf_source = "localized_last_trusted"
+
+        self._trace_tf_pose_source(
+            source=tf_source,
+            linear_mag=linear_mag,
+            angular_mag=angular_mag,
+            localized_age_s=localized_age_s,
+        )
 
         self.tf.publish(
             Transform.from_pose("base_link", tf_pose),

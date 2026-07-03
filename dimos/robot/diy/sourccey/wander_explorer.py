@@ -64,6 +64,7 @@ from dimos.utils.logging_config import setup_logger
 
 from .lidar_geometry import normalize_angle_deg
 from .lidar_types import PlanarLidarScan, StopZoneState
+from .run_trace import start_new_run, trace_event
 
 logger = setup_logger()
 
@@ -75,14 +76,15 @@ class WanderState(str, Enum):
     IDLE = "idle"
     DRIVE = "drive"
     TURN = "turn"
+    SETTLE = "settle"
     DONE = "done"
 
 
 class SourcceyWanderExplorerConfig(ModuleConfig):
     # --- LiDAR scan interpretation (must match the point-cloud adapter) ---
-    forward_angle_deg: float = 180.0
+    forward_angle_deg: float = 270.0
     valid_angle_half_width_deg: float = 90.0
-    invert_lateral_axis: bool = True
+    invert_lateral_axis: bool = False
     min_confidence: int = 5
     scan_max_distance_m: float = 8.0
     # Ignore returns closer than this: they are the robot's own body / arms /
@@ -114,7 +116,7 @@ class SourcceyWanderExplorerConfig(ModuleConfig):
 
     # --- Reactive obstacle handling (live scan, robot frame) ---
     turn_trigger_distance_m: float = 0.32
-    resume_clearance_m: float = 0.6
+    resume_clearance_m: float = 0.42
     corridor_half_width_m: float = 0.28
     forward_cone_half_deg: float = 35.0
 
@@ -161,12 +163,38 @@ class SourcceyWanderExplorerConfig(ModuleConfig):
     align_tolerance_deg: float = 18.0
     # Always rotate at least this much before resuming (prevents bolting forward
     # after a tiny turn, which made it keep going the same way).
-    min_turn_deg: float = 55.0
+    min_turn_deg: float = 80.0
     turn_rate_est_scale: float = 1.0
     max_turn_s: float = 6.0
-    heading_refresh_s: float = 0.8
+    heading_refresh_s: float = 1.8
     turn_burst_s: float = 0.35
     turn_settle_pause_s: float = 0.65
+    turn_burst_mapping_enabled: bool = True
+    turn_burst_mapping_min_wait_s: float = 1.0
+    turn_burst_mapping_max_wait_s: float = 3.5
+    drive_burst_s: float = 0.65
+    drive_burst_mapping_enabled: bool = True
+    drive_burst_mapping_min_wait_s: float = 1.0
+    drive_burst_mapping_max_wait_s: float = 3.5
+    # After a turn completes, stop and wait for the offboard mapper to accept a
+    # fresh stationary scan before driving again. This trades speed for cleaner
+    # map stitching and avoids smearing a just-turned snapshot onto stale pose.
+    post_turn_mapping_enabled: bool = True
+    post_turn_mapping_min_wait_s: float = 0.8
+    post_turn_mapping_max_wait_s: float = 2.5
+    post_turn_require_pose_update: bool = True
+    post_turn_require_costmap_update: bool = True
+    post_turn_require_scan_update: bool = True
+    post_turn_require_localized_commit: bool = False
+    settle_min_pose_updates: int = 2
+    settle_min_costmap_updates: int = 2
+    settle_min_scan_updates: int = 3
+    # --- Turn-only mapping test mode ---
+    # For debugging map stitching, bypass all forward motion and simply rotate in
+    # fixed increments, stop, and wait for the mapper to commit a stationary
+    # snapshot before rotating again.
+    turn_only_snapshot_mode: bool = False
+    turn_only_step_deg: float = 45.0
 
     # --- Redirect when the area straight ahead is already mapped ---
     redirect_when_explored: bool = True
@@ -185,8 +213,11 @@ class SourcceyWanderExplorerConfig(ModuleConfig):
     pose_stale_after_s: float = 2.0
     startup_min_free_cells: int = 120
     startup_stabilization_s: float = 1.5
+    startup_require_costmap: bool = True
     log_every_ticks: int = 30
     heartbeat_s: float = 3.0
+    debug_enabled: bool = False
+    debug_min_interval_s: float = _DBG_MIN_INTERVAL_S
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +528,7 @@ class SourcceyWanderExplorer(Module):
 
     scan: In[PlanarLidarScan]
     odom: In[PoseStamped]
+    localized_pose: In[PoseStamped]
     global_costmap: In[OccupancyGrid]
     explore_cmd: In[Bool]
     stop_explore_cmd: In[Bool]
@@ -514,7 +546,12 @@ class SourcceyWanderExplorer(Module):
 
         self._latest_scan: PlanarLidarScan | None = None
         self._latest_pose: PoseStamped | None = None
+        self._latest_localized_pose: PoseStamped | None = None
         self._latest_costmap: OccupancyGrid | None = None
+        self._latest_scan_seq = 0
+        self._latest_pose_seq = 0
+        self._latest_localized_pose_seq = 0
+        self._latest_costmap_seq = 0
         self._safety_blocked = False
         self._last_stop_zone_wall_ts = 0.0
         self._last_pose_wall_ts = 0.0
@@ -538,7 +575,18 @@ class SourcceyWanderExplorer(Module):
         # integrating the commanded angular rate; resync to pose when fresh).
         self._turn_est_yaw: float | None = None
         self._turn_accum_rad = 0.0
+        self._turn_required_rad = math.radians(float(self.config.min_turn_deg))
         self._turn_last_tick_wall_ts = 0.0
+        self._settle_started_wall_ts = 0.0
+        self._settle_scan_seq_baseline = 0
+        self._settle_pose_seq_baseline = 0
+        self._settle_localized_pose_seq_baseline = 0
+        self._settle_costmap_seq_baseline = 0
+        self._settle_resume_state = WanderState.DRIVE
+        self._settle_reason = "startup"
+        self._settle_min_wait_s = 0.0
+        self._settle_max_wait_s = 0.0
+        self._drive_segment_started_wall_ts = 0.0
         self._explored_since_wall_ts: float | None = None
         self._done_since_wall_ts: float | None = None
         self._started_wall_ts = 0.0
@@ -570,21 +618,24 @@ class SourcceyWanderExplorer(Module):
     def _dbg(self, tag: str, **fields: Any) -> None:
         """Rate-limited ``[wander.<tag>]`` debug logging.
 
-        Disabled: this was the diagnostic spam used to debug the movement/mapping
-        issues. Uncomment the body below to re-enable per-tag debug logs.
+        Enable via ``debug_enabled=True`` in the blueprint/config when chasing
+        wander or mapping issues.
         """
-        return
-        # now = time.time()
-        # if (now - self._dbg_last_wall_ts.get(tag, 0.0)) < _DBG_MIN_INTERVAL_S:
-        #     return
-        # self._dbg_last_wall_ts[tag] = now
-        # logger.info(f"[wander.{tag}]", **fields)
+        if not bool(self.config.debug_enabled):
+            return
+        now = time.time()
+        min_interval_s = max(float(self.config.debug_min_interval_s), 0.0)
+        if (now - self._dbg_last_wall_ts.get(tag, 0.0)) < min_interval_s:
+            return
+        self._dbg_last_wall_ts[tag] = now
+        logger.info(f"[wander.{tag}]", **fields)
 
     @rpc
     def start(self) -> None:
         super().start()
         self.register_disposable(Disposable(self.scan.subscribe(self._on_scan)))
         self.register_disposable(Disposable(self.odom.subscribe(self._on_odom)))
+        self.register_disposable(Disposable(self.localized_pose.subscribe(self._on_localized_pose)))
         self.register_disposable(Disposable(self.global_costmap.subscribe(self._on_costmap)))
         self.register_disposable(Disposable(self.explore_cmd.subscribe(self._on_explore_cmd)))
         self.register_disposable(
@@ -594,20 +645,40 @@ class SourcceyWanderExplorer(Module):
 
         self._started_wall_ts = time.time()
         if bool(self.config.auto_start):
-            self._state = WanderState.DRIVE
+            self._state = (
+                WanderState.TURN
+                if bool(self.config.turn_only_snapshot_mode)
+                else WanderState.DRIVE
+            )
 
         self._stop_event.clear()
         self._control_thread = threading.Thread(target=self._control_loop, daemon=True)
         self._control_thread.start()
+        session = start_new_run(
+            component="wander_explorer",
+            label="sourccey_lidar_mapping_offboard_explore",
+        )
         logger.info(
             "SourcceyWanderExplorer control loop started",
             auto_start=bool(self.config.auto_start),
             initial_state=self._state.value,
             start_delay_s=float(self.config.start_delay_s),
         )
+        trace_event(
+            "wander_explorer",
+            "start",
+            auto_start=bool(self.config.auto_start),
+            initial_state=self._state.value,
+            start_delay_s=float(self.config.start_delay_s),
+            turn_only_snapshot_mode=bool(self.config.turn_only_snapshot_mode),
+            turn_only_step_deg=float(self.config.turn_only_step_deg),
+            run_id=session["run_id"],
+            run_dir=session["run_dir"],
+        )
 
     @rpc
     def stop(self) -> None:
+        trace_event("wander_explorer", "stop_requested", state=self._state.value)
         self._stop_event.set()
         if self._control_thread is not None and self._control_thread.is_alive():
             self._control_thread.join(timeout=2.0)
@@ -620,6 +691,7 @@ class SourcceyWanderExplorer(Module):
     def _on_scan(self, scan: PlanarLidarScan) -> None:
         with self._lock:
             self._latest_scan = scan
+            self._latest_scan_seq += 1
             self._last_scan_wall_ts = time.time()
         self._dbg("rx_scan", beams=len(getattr(scan, "angles_deg", []) or []))
 
@@ -627,8 +699,20 @@ class SourcceyWanderExplorer(Module):
         with self._lock:
             self._latest_pose = pose
             self._last_pose_wall_ts = time.time()
+            self._latest_pose_seq += 1
         self._dbg(
             "rx_odom",
+            x=round(float(pose.x), 3),
+            y=round(float(pose.y), 3),
+            yaw_deg=round(math.degrees(float(pose.yaw)), 1),
+        )
+
+    def _on_localized_pose(self, pose: PoseStamped) -> None:
+        with self._lock:
+            self._latest_localized_pose = pose
+            self._latest_localized_pose_seq += 1
+        self._dbg(
+            "rx_localized_pose",
             x=round(float(pose.x), 3),
             y=round(float(pose.y), 3),
             yaw_deg=round(math.degrees(float(pose.yaw)), 1),
@@ -650,6 +734,7 @@ class SourcceyWanderExplorer(Module):
         free = int(np.sum(grid.grid == int(CostValues.FREE))) if grid.grid.size else 0
         with self._lock:
             self._latest_costmap = grid
+            self._latest_costmap_seq += 1
             self._frontier_count = frontier
             self._free_cells = free
         self._dbg("rx_costmap", frontier_cells=frontier, free_cells=free, shape=tuple(grid.grid.shape))
@@ -694,6 +779,9 @@ class SourcceyWanderExplorer(Module):
             costmap = self._latest_costmap
             frontier_count = self._frontier_count
             free_cells = self._free_cells
+            scan_seq = self._latest_scan_seq
+            pose_seq = self._latest_pose_seq
+            costmap_seq = self._latest_costmap_seq
             last_pose_wall = self._last_pose_wall_ts
             last_scan_wall = self._last_scan_wall_ts
             safety_blocked_raw = self._safety_blocked
@@ -750,10 +838,15 @@ class SourcceyWanderExplorer(Module):
         # One-time startup stabilization. Once latched complete it never re-gates,
         # so turns (which legitimately stale the pose) can't deadlock the robot.
         if bool(self.config.auto_start) and not self._startup_complete:
+            require_costmap = bool(self.config.startup_require_costmap)
             startup_ready = (
                 pose_fresh
-                and costmap is not None
-                and free_cells >= int(self.config.startup_min_free_cells)
+                and (scan_fresh or not require_costmap)
+                and ((costmap is not None) or not require_costmap)
+                and (
+                    free_cells >= int(self.config.startup_min_free_cells)
+                    or not require_costmap
+                )
             )
             if not startup_ready:
                 self._startup_ready_since_wall_ts = None
@@ -761,8 +854,10 @@ class SourcceyWanderExplorer(Module):
                     "gate",
                     reason="startup_not_ready",
                     pose_fresh=pose_fresh,
+                    scan_fresh=scan_fresh,
                     have_costmap=costmap is not None,
                     free_cells=free_cells,
+                    require_costmap=require_costmap,
                     need_free_cells=int(self.config.startup_min_free_cells),
                 )
                 self._publish_stop()
@@ -771,8 +866,10 @@ class SourcceyWanderExplorer(Module):
                     state=state.value,
                     note="waiting for stable startup map/pose",
                     pose_fresh=pose_fresh,
+                    scan_fresh=scan_fresh,
                     have_costmap=costmap is not None,
                     free_cells=free_cells,
+                    require_costmap=require_costmap,
                 )
                 return
             if self._startup_ready_since_wall_ts is None:
@@ -848,9 +945,50 @@ class SourcceyWanderExplorer(Module):
         )
 
         if state == WanderState.DRIVE:
-            self._tick_drive(pose, pose_fresh, costmap, clearance, effective_trigger, safety_blocked, now)
+            self._tick_drive(
+                pose,
+                pose_fresh,
+                costmap,
+                clearance,
+                effective_trigger,
+                safety_blocked,
+                scan_seq,
+                pose_seq,
+                costmap_seq,
+                now,
+            )
         elif state == WanderState.TURN:
-            self._tick_turn(pose, pose_fresh, costmap, clearance, safety_blocked, now)
+            if (
+                bool(self.config.turn_only_snapshot_mode)
+                and self._target_heading is None
+                and pose_fresh
+                and pose is not None
+            ):
+                self._begin_turn(pose, pose_fresh, costmap, now, reason="snapshot_step")
+            self._tick_turn(
+                pose,
+                pose_fresh,
+                costmap,
+                clearance,
+                safety_blocked,
+                scan_seq,
+                pose_seq,
+                costmap_seq,
+                now,
+            )
+        elif state == WanderState.SETTLE:
+            self._tick_settle(
+                pose,
+                pose_fresh,
+                costmap,
+                clearance,
+                safety_blocked,
+                scan_fresh,
+                scan_seq,
+                pose_seq,
+                costmap_seq,
+                now,
+            )
 
     def _effective_turn_trigger(self) -> float:
         """Velocity-scaled distance at which to start turning before an obstacle."""
@@ -877,6 +1015,9 @@ class SourcceyWanderExplorer(Module):
         clearance: float,
         effective_trigger: float,
         safety_blocked: bool,
+        scan_seq: int,
+        pose_seq: int,
+        costmap_seq: int,
         now: float,
     ) -> None:
         # The hard safety gate has vetoed forward motion: don't keep pushing into
@@ -931,6 +1072,31 @@ class SourcceyWanderExplorer(Module):
             self._begin_turn(pose, pose_fresh, costmap, now, reason="wall" if wall_ahead else "explored")
             return
 
+        if (
+            bool(self.config.drive_burst_mapping_enabled)
+            and float(self.config.drive_burst_s) > 0.0
+            and self._drive_segment_started_wall_ts > 0.0
+            and (now - self._drive_segment_started_wall_ts) >= float(self.config.drive_burst_s)
+        ):
+            self._begin_mapping_settle(
+                now,
+                scan_seq=scan_seq,
+                pose_seq=pose_seq,
+                costmap_seq=costmap_seq,
+                resume_state=WanderState.DRIVE,
+                reason="drive_burst",
+                min_wait_s=float(self.config.drive_burst_mapping_min_wait_s),
+                max_wait_s=float(self.config.drive_burst_mapping_max_wait_s),
+            )
+            self._dbg(
+                "drive_burst_settle",
+                elapsed_s=round(now - self._drive_segment_started_wall_ts, 3),
+                clearance_m=round(float(clearance), 3),
+            )
+            self._publish_stop()
+            self._maybe_log(clearance, "drive_burst_settle")
+            return
+
         self._drive_forward(now)
         self._maybe_log(clearance, "drive")
 
@@ -941,6 +1107,9 @@ class SourcceyWanderExplorer(Module):
         costmap: OccupancyGrid | None,
         clearance: float,
         safety_blocked: bool,
+        scan_seq: int,
+        pose_seq: int,
+        costmap_seq: int,
         now: float,
     ) -> None:
         # Keep the estimated yaw locked to the real pose whenever one is available
@@ -948,7 +1117,9 @@ class SourcceyWanderExplorer(Module):
         # bursts). This corrects any drift in the integrated estimate.
         if pose_fresh and pose is not None:
             self._turn_est_yaw = float(pose.yaw)
-            if (now - self._heading_refreshed_wall_ts) >= float(self.config.heading_refresh_s):
+            if self._target_heading is None and (now - self._heading_refreshed_wall_ts) >= float(
+                self.config.heading_refresh_s
+            ):
                 self._refresh_target_heading(pose, costmap, now)
                 if self._target_heading is not None and self._turn_est_yaw is not None:
                     err = angle_diff(self._target_heading, self._turn_est_yaw)
@@ -962,7 +1133,7 @@ class SourcceyWanderExplorer(Module):
 
         # How much have we actually rotated, and are we pointed at the target yet?
         turned_rad = abs(self._turn_accum_rad)
-        min_turn_rad = math.radians(float(self.config.min_turn_deg))
+        min_turn_rad = max(float(self._turn_required_rad), 0.0)
         align_rad = math.radians(float(self.config.align_tolerance_deg))
         if self._target_heading is not None and self._turn_est_yaw is not None:
             remaining_rad = abs(angle_diff(self._target_heading, self._turn_est_yaw))
@@ -975,19 +1146,54 @@ class SourcceyWanderExplorer(Module):
         aligned = remaining_rad is not None and remaining_rad <= align_rad
         turned_enough = turned_rad >= min_turn_rad
         path_clear = clearance >= float(self.config.resume_clearance_m)
-        if not safety_blocked and path_clear and (aligned or turned_enough):
-            with self._lock:
-                if self._state == WanderState.TURN:
-                    self._state = WanderState.DRIVE
-            self._explored_since_wall_ts = None
-            self._dbg(
-                "resume",
-                turned_deg=round(math.degrees(turned_rad), 1),
-                remaining_deg=None if remaining_rad is None else round(math.degrees(remaining_rad), 1),
-                clearance_m=round(float(clearance), 3),
-            )
-            self._drive_forward(now)
-            self._maybe_log(clearance, "resume_drive")
+        turn_only_mode = bool(self.config.turn_only_snapshot_mode)
+        turn_complete = (aligned or turned_enough) if turn_only_mode else (
+            (not safety_blocked) and path_clear and (aligned or turned_enough)
+        )
+        if turn_complete:
+            if bool(self.config.post_turn_mapping_enabled):
+                self._begin_mapping_settle(
+                    now,
+                    scan_seq=scan_seq,
+                    pose_seq=pose_seq,
+                    costmap_seq=costmap_seq,
+                    resume_state=WanderState.TURN if turn_only_mode else WanderState.DRIVE,
+                    reason="snapshot_turn" if turn_only_mode else "post_turn",
+                    min_wait_s=float(self.config.post_turn_mapping_min_wait_s),
+                    max_wait_s=float(self.config.post_turn_mapping_max_wait_s),
+                )
+                self._dbg(
+                    "resume_to_settle",
+                    turned_deg=round(math.degrees(turned_rad), 1),
+                    remaining_deg=None if remaining_rad is None else round(math.degrees(remaining_rad), 1),
+                    clearance_m=round(float(clearance), 3),
+                )
+                self._publish_stop()
+                self._maybe_log(clearance, "post_turn_settle")
+            else:
+                with self._lock:
+                    if self._state == WanderState.TURN:
+                        self._state = WanderState.TURN if turn_only_mode else WanderState.DRIVE
+                self._explored_since_wall_ts = None
+                if turn_only_mode:
+                    self._target_heading = None
+                    self._turn_started_wall_ts = now
+                    self._turn_burst_started_wall_ts = now
+                    self._turn_pause_until_wall_ts = 0.0
+                    self._turn_accum_rad = 0.0
+                    self._turn_last_tick_wall_ts = now
+                self._dbg(
+                    "resume",
+                    turned_deg=round(math.degrees(turned_rad), 1),
+                    remaining_deg=None if remaining_rad is None else round(math.degrees(remaining_rad), 1),
+                    clearance_m=round(float(clearance), 3),
+                )
+                if turn_only_mode:
+                    self._publish_stop()
+                    self._maybe_log(clearance, "resume_turn_only")
+                else:
+                    self._drive_forward(now)
+                    self._maybe_log(clearance, "resume_drive")
             return
 
         # Anti-stuck: if a turn drags on without ever satisfying resume, flip the
@@ -1006,11 +1212,30 @@ class SourcceyWanderExplorer(Module):
             and float(self.config.turn_settle_pause_s) > 0.0
             and (now - self._turn_burst_started_wall_ts) >= float(self.config.turn_burst_s)
         ):
-            self._turn_pause_until_wall_ts = now + float(self.config.turn_settle_pause_s)
-            self._turn_burst_started_wall_ts = self._turn_pause_until_wall_ts
-            self._turn_last_tick_wall_ts = now
-            self._publish_stop()
-            self._maybe_log(clearance, "turn_pause")
+            if bool(self.config.turn_burst_mapping_enabled):
+                self._begin_mapping_settle(
+                    now,
+                    scan_seq=scan_seq,
+                    pose_seq=pose_seq,
+                    costmap_seq=costmap_seq,
+                    resume_state=WanderState.TURN,
+                    reason="turn_burst",
+                    min_wait_s=float(self.config.turn_burst_mapping_min_wait_s),
+                    max_wait_s=float(self.config.turn_burst_mapping_max_wait_s),
+                )
+                self._dbg(
+                    "turn_burst_settle",
+                    turned_deg=round(math.degrees(abs(self._turn_accum_rad)), 1),
+                    clearance_m=round(float(clearance), 3),
+                )
+                self._publish_stop()
+                self._maybe_log(clearance, "turn_burst_settle")
+            else:
+                self._turn_pause_until_wall_ts = now + float(self.config.turn_settle_pause_s)
+                self._turn_burst_started_wall_ts = self._turn_pause_until_wall_ts
+                self._turn_last_tick_wall_ts = now
+                self._publish_stop()
+                self._maybe_log(clearance, "turn_pause")
             return
 
         # Command the turn and integrate the commanded rotation into the estimate.
@@ -1043,6 +1268,259 @@ class SourcceyWanderExplorer(Module):
         self._publish(0.0, self.config.turn_speed_rad_s * direction)
         self._maybe_log(clearance, "turn")
 
+    def _tick_settle(
+        self,
+        pose: PoseStamped | None,
+        pose_fresh: bool,
+        costmap: OccupancyGrid | None,
+        clearance: float,
+        safety_blocked: bool,
+        scan_fresh: bool,
+        scan_seq: int,
+        pose_seq: int,
+        costmap_seq: int,
+        now: float,
+    ) -> None:
+        elapsed_s = max(0.0, now - float(self._settle_started_wall_ts))
+        min_wait_s = max(float(self._settle_min_wait_s), 0.0)
+        max_wait_s = max(float(self._settle_max_wait_s), min_wait_s)
+        path_clear = clearance >= float(self.config.resume_clearance_m)
+        scan_seq_delta = int(scan_seq) - int(self._settle_scan_seq_baseline)
+        pose_seq_delta = int(pose_seq) - int(self._settle_pose_seq_baseline)
+        localized_pose_seq_delta = int(self._latest_localized_pose_seq) - int(
+            self._settle_localized_pose_seq_baseline
+        )
+        pose_ready = (not bool(self.config.post_turn_require_pose_update)) or (
+            pose_fresh and pose_seq_delta >= max(int(self.config.settle_min_pose_updates), 1)
+        )
+        costmap_ready = (not bool(self.config.post_turn_require_costmap_update)) or (
+            costmap is not None
+            and (int(costmap_seq) - int(self._settle_costmap_seq_baseline))
+            >= max(int(self.config.settle_min_costmap_updates), 1)
+        )
+        scan_ready = (not bool(self.config.post_turn_require_scan_update)) or (
+            scan_fresh and scan_seq_delta >= max(int(self.config.settle_min_scan_updates), 1)
+        )
+        localized_ready = (not bool(self.config.post_turn_require_localized_commit)) or (
+            localized_pose_seq_delta >= 1
+        )
+        costmap_seq_delta = int(costmap_seq) - int(self._settle_costmap_seq_baseline)
+
+        if safety_blocked or not path_clear:
+            self._dbg(
+                "settle_reenter_turn",
+                safety_blocked=safety_blocked,
+                clearance_m=round(float(clearance), 3),
+            )
+            self._begin_turn(pose, pose_fresh, costmap, now, reason="wall")
+            return
+
+        if elapsed_s >= min_wait_s and scan_ready and pose_ready and costmap_ready and localized_ready:
+            if self._settle_resume_state == WanderState.TURN:
+                if bool(self.config.turn_only_snapshot_mode) and pose_fresh and pose is not None:
+                    self._begin_turn(pose, pose_fresh, costmap, now, reason="snapshot_step")
+                else:
+                    with self._lock:
+                        if self._state == WanderState.SETTLE:
+                            self._state = WanderState.TURN
+                    if bool(self.config.turn_only_snapshot_mode):
+                        self._target_heading = None
+                    self._turn_pause_until_wall_ts = 0.0
+                    self._turn_burst_started_wall_ts = now
+                    self._turn_last_tick_wall_ts = now
+                    if pose_fresh and pose is not None:
+                        self._turn_est_yaw = float(pose.yaw)
+                logger.info(
+                    "SourcceyWanderExplorer turn-burst mapping settle complete",
+                    elapsed_s=round(elapsed_s, 3),
+                    scan_ready=scan_ready,
+                    pose_ready=pose_ready,
+                    costmap_ready=costmap_ready,
+                    scan_seq=scan_seq,
+                    pose_seq=pose_seq,
+                    costmap_seq=costmap_seq,
+                    scan_seq_delta=scan_seq_delta,
+                    pose_seq_delta=pose_seq_delta,
+                    costmap_seq_delta=costmap_seq_delta,
+                    reason=self._settle_reason,
+                )
+                trace_event(
+                    "wander_explorer",
+                    "settle_complete_resume_turn",
+                    elapsed_s=round(elapsed_s, 3),
+                    scan_ready=bool(scan_ready),
+                    pose_ready=bool(pose_ready),
+                    costmap_ready=bool(costmap_ready),
+                    scan_seq_delta=int(scan_seq_delta),
+                    pose_seq_delta=int(pose_seq_delta),
+                    localized_pose_seq_delta=int(localized_pose_seq_delta),
+                    costmap_seq_delta=int(costmap_seq_delta),
+                    reason=str(self._settle_reason),
+                )
+                self._maybe_log(clearance, "resume_turn")
+            else:
+                with self._lock:
+                    if self._state == WanderState.SETTLE:
+                        self._state = WanderState.DRIVE
+                self._explored_since_wall_ts = None
+                logger.info(
+                    "SourcceyWanderExplorer mapping settle complete",
+                    elapsed_s=round(elapsed_s, 3),
+                    scan_ready=scan_ready,
+                    pose_ready=pose_ready,
+                    costmap_ready=costmap_ready,
+                    scan_seq=scan_seq,
+                    pose_seq=pose_seq,
+                    costmap_seq=costmap_seq,
+                    scan_seq_delta=scan_seq_delta,
+                    pose_seq_delta=pose_seq_delta,
+                    costmap_seq_delta=costmap_seq_delta,
+                    reason=self._settle_reason,
+                )
+                trace_event(
+                    "wander_explorer",
+                    "settle_complete_resume_drive",
+                    elapsed_s=round(elapsed_s, 3),
+                    scan_ready=bool(scan_ready),
+                    pose_ready=bool(pose_ready),
+                    costmap_ready=bool(costmap_ready),
+                    scan_seq_delta=int(scan_seq_delta),
+                    pose_seq_delta=int(pose_seq_delta),
+                    localized_pose_seq_delta=int(localized_pose_seq_delta),
+                    costmap_seq_delta=int(costmap_seq_delta),
+                    reason=str(self._settle_reason),
+                )
+                self._drive_forward(now)
+                self._maybe_log(clearance, "resume_drive")
+            return
+
+        if elapsed_s >= max_wait_s:
+            if self._settle_resume_state == WanderState.TURN and not localized_ready:
+                logger.warning(
+                    "SourcceyWanderExplorer mapping settle waiting for trusted localized commit",
+                    elapsed_s=round(elapsed_s, 3),
+                    scan_ready=scan_ready,
+                    pose_ready=pose_ready,
+                    localized_ready=localized_ready,
+                    costmap_ready=costmap_ready,
+                    scan_seq_delta=scan_seq_delta,
+                    pose_seq_delta=pose_seq_delta,
+                    localized_pose_seq_delta=localized_pose_seq_delta,
+                    costmap_seq_delta=costmap_seq_delta,
+                    reason=self._settle_reason,
+                )
+                trace_event(
+                    "wander_explorer",
+                    "settle_waiting_for_localized_commit",
+                    elapsed_s=round(elapsed_s, 3),
+                    scan_ready=bool(scan_ready),
+                    pose_ready=bool(pose_ready),
+                    localized_ready=bool(localized_ready),
+                    costmap_ready=bool(costmap_ready),
+                    scan_seq_delta=int(scan_seq_delta),
+                    pose_seq_delta=int(pose_seq_delta),
+                    localized_pose_seq_delta=int(localized_pose_seq_delta),
+                    costmap_seq_delta=int(costmap_seq_delta),
+                    reason=str(self._settle_reason),
+                )
+                self._settle_started_wall_ts = now
+                self._publish_stop()
+                self._maybe_log(clearance, "wait_localized_commit")
+                return
+            if self._settle_resume_state == WanderState.TURN:
+                if bool(self.config.turn_only_snapshot_mode) and pose_fresh and pose is not None:
+                    self._begin_turn(pose, pose_fresh, costmap, now, reason="snapshot_step")
+                else:
+                    with self._lock:
+                        if self._state == WanderState.SETTLE:
+                            self._state = WanderState.TURN
+                    if bool(self.config.turn_only_snapshot_mode):
+                        self._target_heading = None
+                    self._turn_pause_until_wall_ts = 0.0
+                    self._turn_burst_started_wall_ts = now
+                    self._turn_last_tick_wall_ts = now
+                logger.info(
+                    "SourcceyWanderExplorer turn-burst mapping settle timed out",
+                    elapsed_s=round(elapsed_s, 3),
+                    scan_ready=scan_ready,
+                    pose_ready=pose_ready,
+                    costmap_ready=costmap_ready,
+                    scan_seq=scan_seq,
+                    pose_seq=pose_seq,
+                    costmap_seq=costmap_seq,
+                    scan_seq_delta=scan_seq_delta,
+                    pose_seq_delta=pose_seq_delta,
+                    costmap_seq_delta=costmap_seq_delta,
+                    reason=self._settle_reason,
+                )
+                trace_event(
+                    "wander_explorer",
+                    "settle_timeout_resume_turn",
+                    elapsed_s=round(elapsed_s, 3),
+                    scan_ready=bool(scan_ready),
+                    pose_ready=bool(pose_ready),
+                    costmap_ready=bool(costmap_ready),
+                    scan_seq_delta=int(scan_seq_delta),
+                    pose_seq_delta=int(pose_seq_delta),
+                    localized_pose_seq_delta=int(localized_pose_seq_delta),
+                    costmap_seq_delta=int(costmap_seq_delta),
+                    reason=str(self._settle_reason),
+                )
+                self._maybe_log(clearance, "resume_turn_timeout")
+            else:
+                with self._lock:
+                    if self._state == WanderState.SETTLE:
+                        self._state = WanderState.DRIVE
+                self._explored_since_wall_ts = None
+                logger.info(
+                    "SourcceyWanderExplorer mapping settle timed out",
+                    elapsed_s=round(elapsed_s, 3),
+                    scan_ready=scan_ready,
+                    pose_ready=pose_ready,
+                    costmap_ready=costmap_ready,
+                    scan_seq=scan_seq,
+                    pose_seq=pose_seq,
+                    costmap_seq=costmap_seq,
+                    scan_seq_delta=scan_seq_delta,
+                    pose_seq_delta=pose_seq_delta,
+                    costmap_seq_delta=costmap_seq_delta,
+                    reason=self._settle_reason,
+                )
+                trace_event(
+                    "wander_explorer",
+                    "settle_timeout_resume_drive",
+                    elapsed_s=round(elapsed_s, 3),
+                    scan_ready=bool(scan_ready),
+                    pose_ready=bool(pose_ready),
+                    costmap_ready=bool(costmap_ready),
+                    scan_seq_delta=int(scan_seq_delta),
+                    pose_seq_delta=int(pose_seq_delta),
+                    localized_pose_seq_delta=int(localized_pose_seq_delta),
+                    costmap_seq_delta=int(costmap_seq_delta),
+                    reason=str(self._settle_reason),
+                )
+                self._drive_forward(now)
+                self._maybe_log(clearance, "resume_drive_timeout")
+            return
+
+        self._publish_stop()
+        self._heartbeat(
+            now,
+            state=self._state.value,
+            note=f"waiting for mapping settle ({self._settle_reason})",
+            elapsed_s=round(elapsed_s, 2),
+            scan_ready=scan_ready,
+            pose_ready=pose_ready,
+            localized_ready=localized_ready,
+            costmap_ready=costmap_ready,
+            scan_seq_delta=scan_seq_delta,
+            pose_seq_delta=pose_seq_delta,
+            localized_pose_seq_delta=localized_pose_seq_delta,
+            costmap_seq_delta=costmap_seq_delta,
+            clearance_m=round(float(clearance), 3),
+        )
+        self._maybe_log(clearance, "settle")
+
     def _begin_turn(
         self,
         pose: PoseStamped | None,
@@ -1061,18 +1539,40 @@ class SourcceyWanderExplorer(Module):
         self._turn_started_wall_ts = now
         self._turn_burst_started_wall_ts = now
         self._turn_pause_until_wall_ts = 0.0
+        self._drive_segment_started_wall_ts = 0.0
         self._explored_since_wall_ts = None
         # Reset turn-progress tracking for this new turn.
         self._turn_accum_rad = 0.0
         self._turn_last_tick_wall_ts = now
         self._turn_est_yaw = float(pose.yaw) if (pose_fresh and pose is not None) else None
         if pose_fresh and pose is not None:
-            self._refresh_target_heading(pose, costmap, now)
-            if self._target_heading is not None:
-                err = angle_diff(self._target_heading, float(pose.yaw))
-                self._spin_dir = (1.0 if err >= 0.0 else -1.0) * self._yaw_cmd_sign
+            if bool(self.config.turn_only_snapshot_mode) or reason == "snapshot_step":
+                step_rad = math.radians(max(float(self.config.turn_only_step_deg), 1.0))
+                self._spin_dir = 1.0 * self._yaw_cmd_sign
+                self._turn_required_rad = step_rad
+                self._target_heading = math.atan2(
+                    math.sin(float(pose.yaw) + (self._spin_dir * step_rad)),
+                    math.cos(float(pose.yaw) + (self._spin_dir * step_rad)),
+                )
+                self._heading_refreshed_wall_ts = now
+            elif reason in {"safety", "wall"}:
+                self._spin_dir = self._spin_dir_from_scan()
+                turn_rad = math.radians(max(float(self.config.min_turn_deg), 70.0))
+                self._turn_required_rad = turn_rad
+                self._target_heading = math.atan2(
+                    math.sin(float(pose.yaw) + (self._spin_dir * turn_rad)),
+                    math.cos(float(pose.yaw) + (self._spin_dir * turn_rad)),
+                )
+                self._heading_refreshed_wall_ts = now
+            else:
+                self._turn_required_rad = math.radians(max(float(self.config.min_turn_deg), 1.0))
+                self._refresh_target_heading(pose, costmap, now)
+                if self._target_heading is not None:
+                    err = angle_diff(self._target_heading, float(pose.yaw))
+                    self._spin_dir = (1.0 if err >= 0.0 else -1.0) * self._yaw_cmd_sign
         else:
             # No usable pose: pick the more open side from the live scan and bounce.
+            self._turn_required_rad = math.radians(max(float(self.config.min_turn_deg), 1.0))
             self._target_heading = None
             self._spin_dir = self._spin_dir_from_scan()
         logger.info(
@@ -1083,6 +1583,63 @@ class SourcceyWanderExplorer(Module):
             target_heading_deg=None
             if self._target_heading is None
             else round(math.degrees(self._target_heading), 1),
+        )
+        trace_event(
+            "wander_explorer",
+            "begin_turn",
+            reason=str(reason),
+            pose_fresh=bool(pose_fresh),
+            spin_dir=float(self._spin_dir),
+            target_heading_deg=None
+            if self._target_heading is None
+            else round(math.degrees(self._target_heading), 1),
+        )
+
+    def _begin_mapping_settle(
+        self,
+        now: float,
+        *,
+        scan_seq: int,
+        pose_seq: int,
+        costmap_seq: int,
+        resume_state: WanderState,
+        reason: str,
+        min_wait_s: float,
+        max_wait_s: float,
+    ) -> None:
+        with self._lock:
+            self._state = WanderState.SETTLE
+        self._settle_started_wall_ts = now
+        self._settle_scan_seq_baseline = int(scan_seq)
+        self._settle_pose_seq_baseline = int(pose_seq)
+        self._settle_localized_pose_seq_baseline = int(self._latest_localized_pose_seq)
+        self._settle_costmap_seq_baseline = int(costmap_seq)
+        self._settle_resume_state = resume_state
+        self._settle_reason = str(reason)
+        self._settle_min_wait_s = float(min_wait_s)
+        self._settle_max_wait_s = float(max_wait_s)
+        logger.info(
+            "SourcceyWanderExplorer entering mapping settle",
+            reason=self._settle_reason,
+            resume_state=self._settle_resume_state.value,
+            scan_seq_baseline=self._settle_scan_seq_baseline,
+            pose_seq_baseline=self._settle_pose_seq_baseline,
+            localized_pose_seq_baseline=self._settle_localized_pose_seq_baseline,
+            costmap_seq_baseline=self._settle_costmap_seq_baseline,
+            min_wait_s=round(self._settle_min_wait_s, 3),
+            max_wait_s=round(self._settle_max_wait_s, 3),
+        )
+        trace_event(
+            "wander_explorer",
+            "begin_mapping_settle",
+            reason=str(self._settle_reason),
+            resume_state=self._settle_resume_state.value,
+            scan_seq_baseline=int(self._settle_scan_seq_baseline),
+            pose_seq_baseline=int(self._settle_pose_seq_baseline),
+            localized_pose_seq_baseline=int(self._settle_localized_pose_seq_baseline),
+            costmap_seq_baseline=int(self._settle_costmap_seq_baseline),
+            min_wait_s=round(self._settle_min_wait_s, 3),
+            max_wait_s=round(self._settle_max_wait_s, 3),
         )
 
     def _record_committed_heading(self, heading: float) -> None:
@@ -1229,6 +1786,7 @@ class SourcceyWanderExplorer(Module):
         period = float(self.config.re_kick_period_s)
         if not self._was_driving:
             # Fresh start from standstill: full kick to break static friction.
+            self._drive_segment_started_wall_ts = now
             self._drive_kick_until_wall_ts = now + float(self.config.kick_duration_s)
             self._kick_speed = float(self.config.kick_speed_m_s)
             self._next_rekick_wall_ts = (now + period) if period > 0.0 else math.inf
@@ -1248,6 +1806,16 @@ class SourcceyWanderExplorer(Module):
 
     def _publish(self, linear_x: float, angular_z: float) -> None:
         self._prev_cmd_wz = float(angular_z)
+        cmd_key = (round(float(linear_x), 4), round(float(angular_z), 4), self._state.value)
+        if getattr(self, "_last_traced_cmd_key", None) != cmd_key:
+            trace_event(
+                "wander_explorer",
+                "publish_cmd_vel",
+                linear_x=cmd_key[0],
+                angular_z=cmd_key[1],
+                state=cmd_key[2],
+            )
+            self._last_traced_cmd_key = cmd_key
         self._dbg(
             "publish",
             linear_x=round(float(linear_x), 4),
@@ -1263,6 +1831,16 @@ class SourcceyWanderExplorer(Module):
     def _publish_stop(self) -> None:
         self._prev_cmd_wz = 0.0
         self._was_driving = False
+        cmd_key = (0.0, 0.0, self._state.value)
+        if getattr(self, "_last_traced_cmd_key", None) != cmd_key:
+            trace_event(
+                "wander_explorer",
+                "publish_cmd_vel",
+                linear_x=0.0,
+                angular_z=0.0,
+                state=self._state.value,
+            )
+            self._last_traced_cmd_key = cmd_key
         self._dbg("publish_stop", linear_x=0.0, angular_z=0.0)
         self.cmd_vel.publish(Twist(linear=Vector3(0.0, 0.0, 0.0), angular=Vector3(0.0, 0.0, 0.0)))
 

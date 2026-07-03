@@ -1,0 +1,192 @@
+Sourccey Mapping Bug Tracker
+============================
+
+- 2026-06-30: Turn-only/offboard mapping could stay permanently blank after the first wall commit.
+  Root cause:
+  The run trace showed exactly one successful `commit_world_cloud` (`commit_kind=bootstrap`) and then a long sequence
+  of `scan_match_rejected` / `scan_match_pose_jump_rejected` events with `reference_points=120`. In other words, the
+  first stationary snapshot produced a tiny anchor, but every later turn snapshot was forced through normal scan
+  matching against that tiny anchor and never got a second accepted commit. The map therefore never advanced beyond the
+  bootstrap wall, even though the robot physically spun.
+  Fix applied:
+  1. Added a guarded `odom_turn_growth_fallback` path in
+     `dimos/robot/diy/sourccey/lidar_pointcloud_adapter.py`.
+  2. When the anchor is still sparse, the robot has turned in place by a meaningful yaw, XY drift is still tiny, and
+     the candidate scan quality is at least minimally sane, the adapter now commits the stationary snapshot at the
+     odom-seeded pose instead of rejecting forever.
+  3. This recovery is deliberately limited to early sparse-anchor turn growth, so it fixes the “blank map after the
+     first frame” failure without weakening later large-map scan-match safety checks.
+
+- 2026-06-30: Runtime robot box/front-face and explorer turn logic could freeze on stale localized pose during motion.
+  Root cause:
+  The offboard explore blueprint was remapping `SourcceyWanderExplorer.odom` to `localized_pose`, which only updates
+  after accepted stationary map commits. At the same time, `SourcceyConnection` preferred that same fresh
+  `localized_pose` for TF even while the base was actively rotating. In practice this let the chassis physically turn
+  while both the explorer heading logic and the runtime robot marker kept believing the robot was still near the old
+  pose/yaw, which then produced malformed side geometry and repeated wrong turn decisions.
+  Fix applied:
+  1. Remapped `SourcceyWanderExplorer.odom` to the live `odom` stream in
+     `dimos/robot/diy/sourccey/blueprints/smart/sourccey_lidar_mapping_offboard_explore.py`.
+  2. In `dimos/robot/diy/sourccey/connection.py`, TF now prefers localized pose only when that pose is fresh AND the
+     base is effectively stationary; while moving, TF stays on live odom.
+  3. Added `tf_pose_source` trace events so future runs clearly show whether visualization is following live odom or
+     stationary localized map pose.
+
+- 2026-06-30: Turn-only 45-degree snapshot explorer could freeze on the initial map.
+  Root cause:
+  The run trace showed repeated `settle_timeout_resume_turn` events with `pose_ready=false`
+  and `costmap_ready=false`, while the mapper simultaneously logged `stale_odom` and
+  `scan_match_rejected` after the first bootstrap commit. In practice that meant the
+  robot physically turned, but the next stationary snapshot never got accepted into the
+  global map, so Rerun only showed the starting frame.
+  Fix applied:
+  1. Increased offboard scan-match tolerance in
+     `dimos/robot/diy/sourccey/blueprints/smart/sourccey_lidar_mapping_offboard.py`
+     so turn-in-place snapshots can register from sparse pose seeds.
+  2. Disabled post-turn settle dependency on fresh pose/costmap updates in
+     `dimos/robot/diy/sourccey/blueprints/smart/sourccey_lidar_mapping_offboard_explore.py`
+     for the turn-only test mode, and required a fuller scan settle window instead.
+
+- 2026-06-30: Turn-only snapshot mapping could splatter blue/green geometry far outside the room bounds.
+  Root cause:
+  The run trace showed accepted `commit_world_cloud` events arriving after turn motion had already resumed or while
+  the robot was still physically settling. The old holdoff logic trusted only the last nonzero cmd_vel timestamp when
+  a cmd_vel stream was present, so a stale "stationary" keyframe could survive through residual odom motion and get
+  committed at the wrong pose. The same trace history also showed weak large-submap matches being accepted once the
+  reference cloud grew, which let a bad fit smear geometry across the room instead of rejecting it.
+  Fix applied:
+  1. In `dimos/robot/diy/sourccey/lidar_pointcloud_adapter.py`, mapping holdoff now stays active until both recent
+     motion commands AND recent odom motion have gone quiet.
+  2. Stationary keyframes are now invalidated if motion begins while the snapshot batch is being accumulated, and the
+     adapter performs a second holdoff check immediately before resolving/committing a snapshot.
+  3. Large reference clouds now use a stricter scan-match acceptance gate (lower error ceiling, higher overlap floor)
+     so low-quality room-wide matches are rejected instead of splattering the map.
+  4. The offboard/explore blueprints now wait longer and require more stationary scan updates before resuming the next
+     45-degree turn step.
+
+- 2026-06-30: Remembered green obstacle corners could jump to a new location after a later matched snapshot.
+  Root cause:
+  The run trace showed a matched commit accepted at roughly `(x=0.12, y=-0.12, yaw=-35.0deg, overlap=0.55)` after a
+  prior trusted pose near `(x=0.12, y=0.12, yaw=-21.7deg)`. That low-overlap commit translated the committed pose by
+  about 0.24 m, and the obstacle-memory refresh path then re-stamped remembered obstacles at the shifted location.
+  This is why a previously straight green corner appeared to slide with the map.
+  Fix applied:
+  1. Added a `scan_match_pose_jump_rejected` guard in
+     `dimos/robot/diy/sourccey/lidar_pointcloud_adapter.py`.
+  2. A matched snapshot is now rejected if it tries to move the committed pose more than 0.18 m from the last trusted
+     pose while still having only weak overlap (< 0.70).
+  3. The rejection is now traced explicitly so future remembered-object jumps can be tied to the exact bad candidate.
+  4. Extended the guard to reject weak-overlap commits that also rotate too far from the last trusted pose
+     (> 10 degrees), because the observed green-corner shift included both a sideways translation and a clear
+     corner-angle change during the bad accepted snapshot.
+
+- 2026-06-30: Turn-only mapping could stay stuck at the bootstrap frame even while the robot physically spun.
+  Root cause:
+  The run trace showed the first post-bootstrap snapshots never committed. After the bootstrap anchor at
+  `(0.0, 0.0, 0.0deg)`, scan matching kept proposing candidates like `(-0.12, -0.24, 1.2deg, overlap≈0.54)`.
+  In other words, the matcher was using a large XY shift to fake overlap instead of solving the new view as a
+  rotation. The new pose-jump guard correctly rejected those candidates, but because no valid match was found the
+  mapping never progressed beyond the initial frame.
+  Fix applied:
+  1. Added a low-motion scan-match translation clamp in
+     `dimos/robot/diy/sourccey/lidar_pointcloud_adapter.py`.
+  2. When the robot has not translated meaningfully since the last trusted anchor, scan matching now uses a much
+     smaller translation window, forcing turn-in-place snapshots to register by yaw instead of by sliding the map.
+  3. The rejection trace now also records the translation window used, so future stalls can distinguish "bad geometry"
+     from "search window allowed an impossible sideways fit."
+
+- 2026-06-30: Turn snapshots could still drift remembered obstacles or advance without a real stitched commit.
+  Root cause:
+  The latest offboard traces still showed the turn-only explorer advancing after settle windows that had not produced a
+  new localized map commit, while the adapter was still willing to seed turn snapshots from large raw-odom yaw deltas.
+  That combination let the room frame stay partly anchored to the last trusted snapshot while remembered obstacle points
+  were refreshed from a newer, slightly shifted interpretation of the same scene.
+  Fix applied:
+  1. In `dimos/robot/diy/sourccey/lidar_pointcloud_adapter.py`, tiny turn-in-place odom translations are now zeroed,
+     larger odom steps are clamped, and seed yaw deltas are capped by `max_seed_odom_step_deg` before scan matching.
+  2. Offboard mapping disables `odom_turn_growth` fallback and tightens `max_seed_odom_step_deg` so turn snapshots are
+     stitched relative to the last trusted map pose instead of trusting a large raw-odom heading jump.
+  3. Remembered obstacle memory is no longer cleared/repositioned around every currently visible obstacle; only trusted
+     commits are allowed to alter the persisted green memory layer.
+  4. `SourcceyWanderExplorer` now subscribes to `localized_pose` and, in turn-only snapshot mode, waits for an actual
+     localized commit before it is allowed to continue to the next turn step.
+
+- 2026-06-30: The Rerun robot box could stay visually frozen even while the robot was physically turning.
+  Root cause:
+  `SourcceyConnection._publish_observation_pose()` had a fallback path that only published `odom` and skipped TF.
+  Rerun anchors the cyan base box to `tf#/base_link`, so whenever observations continued but packet-driven TF updates
+  paused or lagged, the viewer could keep drawing the box at the old pose even though fresh odom was being emitted.
+  Fix applied:
+  1. `dimos/robot/diy/sourccey/connection.py` now routes both observation-pose publish paths through
+     `_publish_pose_and_tf()` so TF always advances together with odom.
+  2. This keeps the runtime box and heading marker tied to the same live pose source the rest of the stack sees.
+
+- 2026-06-30: Scan matches that disagreed too much with the live IMU/odom seed could still twist the room or slant remembered obstacles.
+  Root cause:
+  Some accepted matches had decent local geometry scores but still implied a pose too far from the current seed pose.
+  In a sparse, partly symmetric room that lets the matcher "snap" to a wrong orientation/translation, which then
+  refreshes the blue room outline and the green remembered-obstacle layer from the wrong frame.
+  Fix applied:
+  1. Added a seed-consistency guard in `dimos/robot/diy/sourccey/lidar_pointcloud_adapter.py`.
+  2. A candidate match is now rejected if it has less-than-excellent overlap and still departs too far from the current
+     IMU/odom seed pose in translation or yaw.
+  3. Offboard mapping now also uses stricter pose-jump thresholds and stricter obstacle-memory refresh thresholds, so
+     only high-confidence matched snapshots are allowed to alter persisted remembered obstacles.
+
+- 2026-06-30: Turn-only offboard mapping could keep physically moving after the viewer map stopped changing, and remembered green walls could stack into thick repeated bands.
+  Root cause:
+  The latest run trace showed the explorer resuming new 45-degree steps after settle windows that had produced only
+  scan updates, not a fresh localized/costmap commit. In the same trace, at least one post-turn snapshot was accepted
+  with extremely high overlap while still changing yaw far less than the turn seed implied, effectively snapping the
+  room back onto almost the previous pose. Separately, trusted obstacle memory points were being appended on every
+  commit without first replacing nearby older memory, so slight pose jitter turned one wall into many repeated green
+  layers.
+  Fix applied:
+  1. In `dimos/robot/diy/sourccey/lidar_pointcloud_adapter.py`, added a turn-snapshot stale-pose guard that rejects
+     "barely rotated but heavily overlapped" candidates whenever the seed says the robot has turned substantially since
+     the last trusted commit.
+  2. The adapter now records the motion epoch of each trusted commit so post-turn snapshots can be compared against the
+     correct last-commit motion context.
+  3. Obstacle memory now replaces nearby older remembered points before storing a newly trusted visible obstacle set,
+     preventing thick repeated green wall stacks from accumulating.
+  4. In `dimos/robot/diy/sourccey/blueprints/smart/sourccey_lidar_mapping_offboard_explore.py`, the explorer now waits
+     for an actual localized commit AND costmap refresh before advancing to the next 45-degree snapshot step, and the
+     settle window is longer so the mapper can finish before motion resumes.
+
+- 2026-07-01: Turn-snapshot wide-search recovery could accept a warp that was worse than the rejected candidate.
+  Root cause:
+  The new `turn_snapshot_wide_search` path did run, but the trace showed it accepting a candidate at approximately
+  `(x=0.188, y=0.188, yaw=-18deg)` even though:
+  1. its overlap (`~0.342`) was LOWER than the already-rejected fit (`~0.400`),
+  2. its score (`~0.0819`) was WORSE than the rejected fit (`~0.0715`), and
+  3. it translated about 0.266 m away from the odom/IMU seed during a turn-only snapshot.
+  That bad acceptance dragged the original room patch into a slanted, distorted location and made later commits
+  reinforce the wrong stitched map.
+  Fix applied:
+  1. `dimos/robot/diy/sourccey/lidar_pointcloud_adapter.py` now rejects wide-search recovery candidates that violate
+     the normal seed-consistency guard (too much XY or yaw jump from the current seed).
+  2. The recovery path now also rejects a candidate if it has LOWER overlap than the failed candidate and no score
+     improvement, instead of treating any returned pose as acceptable.
+  3. Recovery trace lines now include `recovered_reject_reason`, `recovered_seed_jump_m`, and
+     `recovered_seed_yaw_jump_deg` so future bad turn recoveries are obvious in a single log line.
+
+- 2026-07-01: Offboard stationary snapshot matching could throw a freshly turned LiDAR view back onto the old room pose or fail to open new blue space after a turn.
+  Root cause:
+  The run trace showed bootstrap committing correctly, but later post-turn commits either stayed at essentially the
+  same pose or accepted only tiny yaw changes even after a clear physical turn. The core bug was inside
+  `dimos/robot/diy/sourccey/lidar_occupancy_mapper.py`: the configured
+  `scan_match_translation_window_m` / `scan_match_rotation_window_deg` values were being used as PER-STEP jumps
+  instead of total search windows, so the first search pass actually sampled far outside the intended range
+  (for example a `70deg` yaw window sampled up to `+-280deg`). That made it easy for the global matcher to snap a new
+  stationary snapshot onto the wrong old wall geometry in a sparse or partly symmetric room.
+  Fix applied:
+  1. Corrected the search logic so each level spans the requested window instead of multiplying it by the number of
+     coarse search steps.
+  2. Added a consecutive-snapshot local-fit stage in
+     `dimos/robot/diy/sourccey/lidar_occupancy_mapper.py` so a stopped snapshot is first aligned against the previous
+     trusted stationary local scan before any global refinement is allowed.
+  3. Added a guardrail so global refinement is ignored if it tries to pull the locally aligned snapshot too far away
+     (`snapshot_global_refine_ignored`), preventing a good local turn fit from being re-warped by stale map geometry.
+  4. Added trace events `relative_snapshot_pose_resolved`, `relative_snapshot_rejected`, and `snapshot_pose_resolved`
+     so future runs show exactly whether a commit came from relative alignment, guarded global refinement, or the
+     global-only fallback path.

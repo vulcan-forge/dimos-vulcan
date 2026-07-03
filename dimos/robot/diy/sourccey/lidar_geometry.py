@@ -14,7 +14,7 @@ def normalize_angle_deg(angle_deg: float) -> float:
 def scan_to_local_xy(
     scan: PlanarLidarScan,
     *,
-    forward_angle_deg: float = 180.0,
+    forward_angle_deg: float = 270.0,
     max_distance_m: float | None = None,
     min_confidence: int = 0,
 ) -> np.ndarray:
@@ -86,4 +86,3 @@ def detect_stop_zone(scan: PlanarLidarScan, *, cfg: StopZoneConfig) -> StopZoneS
         threshold_points=threshold,
         nearest_blocking_distance_m=nearest_distance,
     )
-

@@ -10,7 +10,10 @@ from dimos.web.websocket_vis.websocket_vis_module import WebsocketVisModule
 
 sourccey_lidar_mapping_offboard_teleop = autoconnect(
     sourccey_lidar_mapping_offboard,
-    SourcceyLidarSafetyGate.blueprint(),
+    SourcceyLidarSafetyGate.blueprint(
+        debug_enabled=True,
+        debug_min_interval_s=0.25,
+    ),
 ).remappings(
     [
         (WebsocketVisModule, "tele_cmd_vel", "teleop_cmd_vel"),
